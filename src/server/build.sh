@@ -5,7 +5,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build_server"
-DUCKDB_DIR="${SCRIPT_DIR}/.."
+DUCKDB_DIR="${SCRIPT_DIR}/../.."
 
 echo "=== DuckDB Server Build Script ==="
 echo "Script directory: ${SCRIPT_DIR}"

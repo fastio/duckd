@@ -20,8 +20,9 @@ void QueryExecutor::Execute(QueryContext context) {
     auto start_time = Clock::now();
     
     try {
-        // Execute query
-        auto result = context.session->GetConnection().SendQuery(context.sql);
+        // Execute query using Query() for materialized results
+        // (SendQuery returns streaming results that can have thread-safety issues)
+        auto result = context.session->GetConnection().Query(context.sql);
         
         if (result->HasError()) {
             SendError(ErrorCode::INVALID_SQL, result->GetError(), context);

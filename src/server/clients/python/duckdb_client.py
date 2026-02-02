@@ -392,10 +392,118 @@ class DuckDBClient:
     
     def _parse_batch(self, data: bytes, types: List[str]) -> List[Tuple]:
         """Parse data batch from RESULT_BATCH"""
-        # Simplified parsing - in a real implementation, this would
-        # properly deserialize Arrow IPC data
-        # For now, return empty list as placeholder
-        return []
+        offset = 0
+
+        # Read array metadata
+        length = struct.unpack_from('<Q', data, offset)[0]
+        offset += 8
+        null_count = struct.unpack_from('<Q', data, offset)[0]
+        offset += 8
+        n_buffers = struct.unpack_from('<Q', data, offset)[0]
+        offset += 8
+        n_children = struct.unpack_from('<Q', data, offset)[0]
+        offset += 8
+
+        if length == 0:
+            return []
+
+        # Parse each column
+        columns_data = []
+        for col_idx in range(n_children):
+            child_length = struct.unpack_from('<Q', data, offset)[0]
+            offset += 8
+            child_null_count = struct.unpack_from('<Q', data, offset)[0]
+            offset += 8
+            child_n_buffers = struct.unpack_from('<Q', data, offset)[0]
+            offset += 8
+
+            col_type = types[col_idx] if col_idx < len(types) else 'u'
+            col_values = []
+
+            # Parse buffers
+            buffers = []
+            for buf_idx in range(child_n_buffers):
+                buf_size = struct.unpack_from('<Q', data, offset)[0]
+                offset += 8
+                if buf_size > 0:
+                    buf_data = data[offset:offset+buf_size]
+                    offset += buf_size
+                    buffers.append(buf_data)
+                else:
+                    buffers.append(None)
+
+            # Convert buffer data to values based on type
+            col_values = self._decode_column(buffers, col_type, child_length, child_null_count)
+            columns_data.append(col_values)
+
+        # Transpose columns to rows
+        rows = []
+        for row_idx in range(length):
+            row = tuple(col[row_idx] if row_idx < len(col) else None for col in columns_data)
+            rows.append(row)
+
+        return rows
+
+    def _decode_column(self, buffers: List, col_type: str, length: int, null_count: int) -> List:
+        """Decode column buffer data based on Arrow type format"""
+        values = []
+
+        # Skip validity bitmap buffer if present (index 0 when there are nulls)
+        data_buf_idx = 1 if null_count > 0 and len(buffers) > 1 else 0
+
+        if not buffers or data_buf_idx >= len(buffers) or buffers[data_buf_idx] is None:
+            return [None] * length
+
+        data_buf = buffers[data_buf_idx]
+
+        try:
+            if col_type in ('l', 'L'):  # INT64/UINT64
+                fmt = '<q' if col_type == 'l' else '<Q'
+                for i in range(length):
+                    values.append(struct.unpack_from(fmt, data_buf, i * 8)[0])
+            elif col_type in ('i', 'I'):  # INT32/UINT32
+                fmt = '<i' if col_type == 'i' else '<I'
+                for i in range(length):
+                    values.append(struct.unpack_from(fmt, data_buf, i * 4)[0])
+            elif col_type in ('s', 'S'):  # INT16/UINT16
+                fmt = '<h' if col_type == 's' else '<H'
+                for i in range(length):
+                    values.append(struct.unpack_from(fmt, data_buf, i * 2)[0])
+            elif col_type in ('c', 'C'):  # INT8/UINT8
+                for i in range(length):
+                    values.append(data_buf[i] if col_type == 'C' else struct.unpack_from('<b', data_buf, i)[0])
+            elif col_type == 'g':  # DOUBLE
+                for i in range(length):
+                    values.append(struct.unpack_from('<d', data_buf, i * 8)[0])
+            elif col_type == 'f':  # FLOAT
+                for i in range(length):
+                    values.append(struct.unpack_from('<f', data_buf, i * 4)[0])
+            elif col_type == 'b':  # BOOL
+                for i in range(length):
+                    byte_idx = i // 8
+                    bit_idx = i % 8
+                    values.append(bool((data_buf[byte_idx] >> bit_idx) & 1))
+            elif col_type in ('u', 'U', 'z', 'Z'):  # String/Binary types
+                # For strings, we need offsets buffer (index 1) and data buffer (index 2)
+                if len(buffers) >= 3 and buffers[1] and buffers[2]:
+                    offsets_buf = buffers[1]
+                    str_data_buf = buffers[2]
+                    for i in range(length):
+                        start = struct.unpack_from('<I', offsets_buf, i * 4)[0]
+                        end = struct.unpack_from('<I', offsets_buf, (i + 1) * 4)[0]
+                        if col_type in ('u', 'U'):  # UTF-8 strings
+                            values.append(str_data_buf[start:end].decode('utf-8'))
+                        else:  # Binary
+                            values.append(bytes(str_data_buf[start:end]))
+                else:
+                    values = [None] * length
+            else:
+                # Unknown type - return None values
+                values = [None] * length
+        except Exception:
+            values = [None] * length
+
+        return values
     
     def _parse_result_end(self, data: bytes) -> Dict[str, int]:
         """Parse RESULT_END payload"""

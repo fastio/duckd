@@ -64,14 +64,43 @@ std::vector<uint8_t> ArrowSerializer::SerializeChunk(
 }
 
 std::vector<uint8_t> ArrowSerializer::SerializeResultHeader(duckdb::QueryResult& result) {
-    return SerializeSchema(result.types, result.names);
+    // Use the result's client_properties which has a valid ClientContext
+    ArrowSchema schema;
+    duckdb::ArrowConverter::ToArrowSchema(&schema, result.types, result.names, result.client_properties);
+
+    auto buffer = SerializeArrowSchema(&schema);
+
+    if (schema.release) {
+        schema.release(&schema);
+    }
+
+    return buffer;
 }
 
 std::vector<uint8_t> ArrowSerializer::SerializeResultBatch(
     duckdb::DataChunk& chunk,
     duckdb::QueryResult& result) {
-    
-    return SerializeChunk(chunk, result.types, result.names);
+
+    // Use the result's client_properties which has a valid ClientContext
+    ArrowSchema schema;
+    ArrowArray array;
+
+    duckdb::ArrowConverter::ToArrowSchema(&schema, result.types, result.names, result.client_properties);
+
+    // Convert chunk to Arrow array
+    duckdb::unordered_map<duckdb::idx_t, const duckdb::shared_ptr<duckdb::ArrowTypeExtensionData>> extension_types;
+    duckdb::ArrowConverter::ToArrowArray(chunk, &array, result.client_properties, extension_types);
+
+    auto buffer = SerializeArrowArray(&schema, &array);
+
+    if (array.release) {
+        array.release(&array);
+    }
+    if (schema.release) {
+        schema.release(&schema);
+    }
+
+    return buffer;
 }
 
 std::vector<uint8_t> ArrowSerializer::SerializeArrowSchema(ArrowSchema* schema) {
@@ -171,67 +200,86 @@ std::vector<uint8_t> ArrowSerializer::SerializeArrowArray(ArrowSchema* schema, A
         }
         
         // Serialize each buffer
+        // Arrow buffer layout (for most types):
+        // - buffer[0]: validity bitmap (can be nullptr if no nulls)
+        // - buffer[1]: data buffer
+        // For variable-length types (strings):
+        // - buffer[0]: validity bitmap
+        // - buffer[1]: offsets (int32 or int64)
+        // - buffer[2]: data
+
+        std::string format = child_schema->format ? child_schema->format : "";
+
         for (int64_t b = 0; b < child_n_buffers; ++b) {
             const void* buf_ptr = child_array->buffers[b];
-            
+            size_t buf_size = 0;
+
             if (buf_ptr == nullptr) {
-                // Null buffer
-                int64_t buf_size = 0;
+                // Null buffer - write 0 size
                 for (int j = 0; j < 8; ++j) {
-                    buffer.push_back((buf_size >> (j * 8)) & 0xFF);
+                    buffer.push_back(0);
                 }
-            } else {
-                // Estimate buffer size based on type and length
-                // This is a simplified version - real implementation would
-                // track buffer sizes properly
-                size_t buf_size = 0;
-                
-                std::string format = child_schema->format ? child_schema->format : "";
-                
-                if (b == 0 && child_null_count > 0) {
-                    // Validity bitmap
-                    buf_size = (child_length + 7) / 8;
-                } else if (format == "l" || format == "L") {
-                    // INT64/UINT64
-                    buf_size = child_length * 8;
-                } else if (format == "i" || format == "I") {
-                    // INT32/UINT32
-                    buf_size = child_length * 4;
-                } else if (format == "s" || format == "S") {
-                    // INT16/UINT16
-                    buf_size = child_length * 2;
-                } else if (format == "c" || format == "C") {
-                    // INT8/UINT8
-                    buf_size = child_length;
-                } else if (format == "g") {
-                    // DOUBLE
-                    buf_size = child_length * 8;
-                } else if (format == "f") {
-                    // FLOAT
-                    buf_size = child_length * 4;
-                } else if (format == "b") {
-                    // BOOL
-                    buf_size = (child_length + 7) / 8;
-                } else if (format == "u" || format == "U" || format == "z" || format == "Z") {
-                    // Variable length types - need offsets + data
-                    // This is complex - simplified for now
-                    if (b == 1) {
-                        // Offsets buffer for regular string (32-bit offsets)
-                        buf_size = (child_length + 1) * 4;
+                continue;
+            }
+
+            // Calculate buffer size based on buffer index and type
+            if (b == 0) {
+                // Buffer 0 is always validity bitmap
+                buf_size = (child_length + 7) / 8;
+            } else if (format == "l" || format == "L") {
+                // INT64/UINT64 - buffer 1 is data
+                buf_size = child_length * 8;
+            } else if (format == "i" || format == "I") {
+                // INT32/UINT32 - buffer 1 is data
+                buf_size = child_length * 4;
+            } else if (format == "s" || format == "S") {
+                // INT16/UINT16 - buffer 1 is data
+                buf_size = child_length * 2;
+            } else if (format == "c" || format == "C") {
+                // INT8/UINT8 - buffer 1 is data
+                buf_size = child_length;
+            } else if (format == "g") {
+                // DOUBLE - buffer 1 is data
+                buf_size = child_length * 8;
+            } else if (format == "f") {
+                // FLOAT - buffer 1 is data
+                buf_size = child_length * 4;
+            } else if (format == "b") {
+                // BOOL - buffer 1 is data (bit-packed)
+                buf_size = (child_length + 7) / 8;
+            } else if (format == "u" || format == "U") {
+                // UTF-8 string (32-bit offsets)
+                if (b == 1) {
+                    // Offsets buffer: (n+1) * 4 bytes
+                    buf_size = (child_length + 1) * 4;
+                } else if (b == 2) {
+                    // Data buffer: get size from last offset
+                    const int32_t* offsets = static_cast<const int32_t*>(child_array->buffers[1]);
+                    if (offsets) {
+                        buf_size = offsets[child_length];
                     }
-                    // Data buffer size would need to be tracked
                 }
-                
-                // Write buffer size
-                for (int j = 0; j < 8; ++j) {
-                    buffer.push_back((buf_size >> (j * 8)) & 0xFF);
+            } else if (format == "z" || format == "Z") {
+                // Binary (32-bit offsets)
+                if (b == 1) {
+                    buf_size = (child_length + 1) * 4;
+                } else if (b == 2) {
+                    const int32_t* offsets = static_cast<const int32_t*>(child_array->buffers[1]);
+                    if (offsets) {
+                        buf_size = offsets[child_length];
+                    }
                 }
-                
-                // Write buffer data
-                if (buf_size > 0) {
-                    const uint8_t* data = static_cast<const uint8_t*>(buf_ptr);
-                    buffer.insert(buffer.end(), data, data + buf_size);
-                }
+            }
+
+            // Write buffer size
+            for (int j = 0; j < 8; ++j) {
+                buffer.push_back((buf_size >> (j * 8)) & 0xFF);
+            }
+
+            // Write buffer data
+            if (buf_size > 0) {
+                const uint8_t* data = static_cast<const uint8_t*>(buf_ptr);
+                buffer.insert(buffer.end(), data, data + buf_size);
             }
         }
     }

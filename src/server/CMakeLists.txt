@@ -159,3 +159,6 @@ install(FILES config/duckdb-server.toml
     DESTINATION etc/duckdb
     RENAME duckdb-server.toml.example
 )
+
+# Build duckdb_remote extension
+add_subdirectory(extension/duckdb_remote)
