@@ -1,7 +1,7 @@
 # DuckD Server Library
-# src/duckd/CMakeLists.txt
+# src/CMakeLists.txt
 
-set(DUCKD_SRC_DIR ${CMAKE_SOURCE_DIR}/src/duckd)
+set(DUCKD_SRC_DIR ${CMAKE_SOURCE_DIR}/src)
 
 set(DUCKD_SERVER_SOURCES
     # Network layer

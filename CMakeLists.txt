@@ -36,10 +36,10 @@ set(DUCKDB_INCLUDE_DIRS
 find_package(Threads REQUIRED)
 
 # Server library
-add_subdirectory(src/duckd)
+add_subdirectory(src)
 
 # Client library
-add_subdirectory(src/duckd-client)
+add_subdirectory(src/client)
 
 # Programs
 add_subdirectory(programs/server)

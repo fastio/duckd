@@ -6,7 +6,7 @@ add_executable(duckd-server ${CMAKE_SOURCE_DIR}/programs/server/main.cpp)
 target_include_directories(duckd-server
     PRIVATE
         ${DUCKDB_INCLUDE_DIRS}
-        ${CMAKE_SOURCE_DIR}/src/duckd
+        ${CMAKE_SOURCE_DIR}/src
 )
 
 target_link_libraries(duckd-server

@@ -7,7 +7,7 @@ add_executable(test_duckd_remote ${CMAKE_SOURCE_DIR}/tests/integration/test_exte
 target_include_directories(test_duckd_remote
     PRIVATE
         ${DUCKDB_INCLUDE_DIRS}
-        ${CMAKE_SOURCE_DIR}/src/duckd-client/remote-client
+        ${CMAKE_SOURCE_DIR}/src/client/remote-client
 )
 
 target_link_libraries(test_duckd_remote

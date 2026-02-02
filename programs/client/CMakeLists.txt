@@ -6,13 +6,13 @@ find_library(READLINE_LIBRARY readline)
 find_path(READLINE_INCLUDE_DIR readline/readline.h)
 
 if(READLINE_LIBRARY AND READLINE_INCLUDE_DIR)
-    add_executable(duckd-client ${CMAKE_SOURCE_DIR}/src/duckd-client/cli/duckdb_remote_cli.cpp)
+    add_executable(duckd-client ${CMAKE_SOURCE_DIR}/src/client/cli/duckdb_remote_cli.cpp)
 
     target_include_directories(duckd-client
         PRIVATE
             ${READLINE_INCLUDE_DIR}
             ${DUCKDB_INCLUDE_DIRS}
-            ${CMAKE_SOURCE_DIR}/src/duckd-client/remote-client
+            ${CMAKE_SOURCE_DIR}/src/client/remote-client
     )
 
     target_link_libraries(duckd-client

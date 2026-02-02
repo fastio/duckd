@@ -1,7 +1,7 @@
 # DuckD Client Library
-# src/duckd-client/CMakeLists.txt
+# src/client/CMakeLists.txt
 
-set(DUCKD_CLIENT_SRC_DIR ${CMAKE_SOURCE_DIR}/src/duckd-client)
+set(DUCKD_CLIENT_SRC_DIR ${CMAKE_SOURCE_DIR}/src/client)
 
 set(DUCKD_CLIENT_SOURCES
     ${DUCKD_CLIENT_SRC_DIR}/remote-client/remote_client.cpp
