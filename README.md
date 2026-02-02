@@ -1,51 +1,97 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: light)" srcset="logo/DuckDB_Logo-horizontal.svg">
-    <source media="(prefers-color-scheme: dark)" srcset="logo/DuckDB_Logo-horizontal-dark-mode.svg">
-    <img alt="DuckDB logo" src="logo/DuckDB_Logo-horizontal.svg" height="100">
-  </picture>
-</div>
-<br>
+# DuckD
 
-<p align="center">
-  <a href="https://github.com/duckdb/duckdb/actions"><img src="https://github.com/duckdb/duckdb/actions/workflows/Main.yml/badge.svg?branch=main" alt="Github Actions Badge"></a>
-  <a href="https://discord.gg/tcvwpjfnZx"><img src="https://shields.io/discord/909674491309850675" alt="discord" /></a>
-  <a href="https://github.com/duckdb/duckdb/releases/"><img src="https://img.shields.io/github/v/release/duckdb/duckdb?color=brightgreen&display_name=tag&logo=duckdb&logoColor=white" alt="Latest Release"></a>
-</p>
+DuckDB Server - A network server for DuckDB with client libraries.
 
-## DuckDB
+## Features
 
-DuckDB is a high-performance analytical database system. It is designed to be fast, reliable, portable, and easy to use. DuckDB provides a rich SQL dialect with support far beyond basic SQL. DuckDB supports arbitrary and nested correlated subqueries, window functions, collations, complex types (arrays, structs, maps), and [several extensions designed to make SQL easier to use](https://duckdb.org/docs/stable/sql/dialect/friendly_sql.html).
+- TCP server for DuckDB with custom binary protocol
+- Arrow IPC serialization for efficient data transfer
+- Session management with connection pooling
+- Remote client extension for DuckDB
+- Interactive CLI client
 
-DuckDB is available as a [standalone CLI application](https://duckdb.org/docs/stable/clients/cli/overview) and has clients for [Python](https://duckdb.org/docs/stable/clients/python/overview), [R](https://duckdb.org/docs/stable/clients/r), [Java](https://duckdb.org/docs/stable/clients/java), [Wasm](https://duckdb.org/docs/stable/clients/wasm/overview), etc., with deep integrations with packages such as [pandas](https://duckdb.org/docs/guides/python/sql_on_pandas) and [dplyr](https://duckdb.org/docs/stable/clients/r#duckplyr-dplyr-api).
+## Project Structure
 
-For more information on using DuckDB, please refer to the [DuckDB documentation](https://duckdb.org/docs/stable/).
-
-## Installation
-
-If you want to install DuckDB, please see [our installation page](https://duckdb.org/docs/installation/) for instructions.
-
-## Data Import
-
-For CSV files and Parquet files, data import is as simple as referencing the file in the FROM clause:
-
-```sql
-SELECT * FROM 'myfile.csv';
-SELECT * FROM 'myfile.parquet';
+```
+duckd/
+├── contrib/
+│   ├── duckdb/          # DuckDB (git submodule)
+│   └── asio/            # ASIO networking library
+├── src/
+│   ├── duckd/           # Server library
+│   │   ├── network/     # TCP server, connection handling
+│   │   ├── protocol/    # Message protocol
+│   │   ├── session/     # Session management
+│   │   ├── executor/    # Query execution
+│   │   └── serialization/  # Arrow serialization
+│   └── duckd-client/    # Client library
+│       ├── remote-client/  # Remote client implementation
+│       ├── cli/         # CLI client
+│       └── python/      # Python client
+├── programs/
+│   ├── server/          # duckd-server entry point
+│   └── client/          # duckd-client entry point
+├── tests/               # Tests
+└── scripts/             # Build scripts
 ```
 
-Refer to our [Data Import](https://duckdb.org/docs/stable/data/overview) section for more information.
+## Building
 
-## SQL Reference
+```bash
+# Clone with submodules
+git clone --recursive https://github.com/user/duckd.git
 
-The documentation contains a [SQL introduction and reference](https://duckdb.org/docs/stable/sql/introduction).
+# Or initialize submodules after clone
+git submodule update --init --recursive
 
-## Development
+# Build
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . -j 8
 
-For development, DuckDB requires [CMake](https://cmake.org), Python 3 and a `C++11` compliant compiler. In the root directory, run `make` to compile the sources. For development, use `make debug` to build a non-optimized debug version. You should run `make unit` and `make allunit` to verify that your version works properly after making changes. To test performance, you can run `BUILD_BENCHMARK=1 BUILD_TPCH=1 make` and then perform several standard benchmarks from the root directory by executing `./build/release/benchmark/benchmark_runner`. The details of benchmarks are in our [Benchmark Guide](benchmark/README.md).
+# Debug build
+cmake -DCMAKE_BUILD_TYPE=Debug ..
+cmake --build . -j 8
+```
 
-Please also refer to our [Build Guide](https://duckdb.org/docs/stable/dev/building/overview) and [Contribution Guide](CONTRIBUTING.md).
+## Usage
 
-## Support
+### Server
 
-See the [Support Options](https://duckdblabs.com/support/) page and the dedicated [`endoflife.date`](https://endoflife.date/duckdb) page.
+```bash
+# Start server
+./build/programs/server/duckd-server
+
+# With options
+./build/programs/server/duckd-server \
+    --host 0.0.0.0 \
+    --port 9999 \
+    --database /path/to/db.duckdb
+```
+
+### CLI Client
+
+```bash
+# Connect to server
+./build/programs/client/duckd-client localhost 9999
+
+# Execute queries
+D> SELECT 1 + 1;
+D> CREATE TABLE test (id INT, name TEXT);
+D> .tables
+D> .help
+```
+
+### Python Client
+
+```python
+from duckdb_client import DuckDBClient
+
+client = DuckDBClient('localhost', 9999)
+result = client.query('SELECT * FROM test')
+print(result)
+```
+
+## License
+
+MIT License
