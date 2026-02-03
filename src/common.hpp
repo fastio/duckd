@@ -42,7 +42,7 @@ class QueryExecutor;
 class ExecutorPool;
 class ProtocolHandler;
 class ArrowSerializer;
-class ServerConfig;
+struct ServerConfig;
 class Logger;
 
 // Shared pointer types

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "config/config_file.hpp"
 #include <string>
 #include <thread>
 #include <iostream>
@@ -16,16 +17,34 @@
 namespace duckdb_server {
 
 struct ServerConfig {
+    // Network
     std::string host = "0.0.0.0";
     uint16_t port = 9999;
+    uint16_t http_port = 0;  // 0 = disabled, for health/metrics
+
+    // Database
     std::string database_path = ":memory:";
+
+    // Logging
     std::string log_file;
     std::string log_level = "info";
 
-    uint32_t io_threads = 0;  // 0 = auto (based on hardware)
+    // Process
+    std::string pid_file;
+    std::string config_file;
+    std::string user;  // User to run as (privilege dropping)
+    bool daemon = false;
+
+    // Threading
+    uint32_t io_threads = 0;  // 0 = auto
     uint32_t executor_threads = 0;  // 0 = auto
     uint32_t max_connections = 100;
     uint32_t session_timeout_minutes = 30;
+
+    // Resource limits
+    uint64_t max_memory = 0;  // 0 = unlimited (bytes)
+    uint32_t max_open_files = 0;  // 0 = system default
+    uint32_t query_timeout_ms = 300000;  // 5 minutes
 
     uint32_t GetIoThreadCount() const {
         if (io_threads == 0) {
@@ -52,37 +71,105 @@ struct ServerConfig {
         }
         return true;
     }
+
+    // Load from config file (values can be overridden by command line)
+    bool LoadFromFile(const std::string& path, std::string& error) {
+        ConfigFile cfg;
+        if (!cfg.Load(path)) {
+            error = cfg.GetError();
+            return false;
+        }
+
+        if (cfg.Has("host")) host = cfg.GetString("host");
+        if (cfg.Has("port")) port = static_cast<uint16_t>(cfg.GetInt("port"));
+        if (cfg.Has("http_port")) http_port = static_cast<uint16_t>(cfg.GetInt("http_port"));
+        if (cfg.Has("database")) database_path = cfg.GetString("database");
+        if (cfg.Has("log_file")) log_file = cfg.GetString("log_file");
+        if (cfg.Has("log_level")) log_level = cfg.GetString("log_level");
+        if (cfg.Has("pid_file")) pid_file = cfg.GetString("pid_file");
+        if (cfg.Has("user")) user = cfg.GetString("user");
+        if (cfg.Has("daemon")) daemon = cfg.GetBool("daemon");
+        if (cfg.Has("io_threads")) io_threads = static_cast<uint32_t>(cfg.GetInt("io_threads"));
+        if (cfg.Has("executor_threads")) executor_threads = static_cast<uint32_t>(cfg.GetInt("executor_threads"));
+        if (cfg.Has("max_connections")) max_connections = static_cast<uint32_t>(cfg.GetInt("max_connections"));
+        if (cfg.Has("session_timeout_minutes")) session_timeout_minutes = static_cast<uint32_t>(cfg.GetInt("session_timeout_minutes"));
+        if (cfg.Has("max_memory")) max_memory = static_cast<uint64_t>(cfg.GetInt("max_memory"));
+        if (cfg.Has("max_open_files")) max_open_files = static_cast<uint32_t>(cfg.GetInt("max_open_files"));
+        if (cfg.Has("query_timeout_ms")) query_timeout_ms = static_cast<uint32_t>(cfg.GetInt("query_timeout_ms"));
+
+        return true;
+    }
 };
 
 inline void PrintUsage(const char* program) {
     std::cout << "Usage: " << program << " [options]\n"
-              << "Options:\n"
+              << "\nOptions:\n"
+              << "  -c, --config <path>     Config file path\n"
               << "  -h, --host <host>       Host to bind (default: 0.0.0.0)\n"
               << "  -p, --port <port>       Port to bind (default: 9999)\n"
               << "  -d, --database <path>   Database path (default: :memory:)\n"
+              << "  --daemon                Run as daemon (background)\n"
+              << "  --pid-file <path>       PID file path\n"
+              << "  --user <name>           User to run as (drops privileges)\n"
               << "  --log-file <path>       Log file path\n"
               << "  --log-level <level>     Log level (debug, info, warn, error)\n"
               << "  --io-threads <n>        IO thread count (default: auto)\n"
               << "  --executor-threads <n>  Executor thread count (default: auto)\n"
               << "  --max-connections <n>   Max connections (default: 100)\n"
+              << "  --http-port <port>      HTTP port for health/metrics (default: disabled)\n"
+              << "  --max-memory <bytes>    Max memory limit (default: unlimited)\n"
+              << "  --max-open-files <n>    Max open file descriptors\n"
+              << "  --query-timeout <ms>    Query timeout in milliseconds (default: 300000)\n"
+              << "  --version               Show version info\n"
               << "  --help                  Show this help\n";
 }
 
-inline ServerConfig ParseCommandLine(int argc, char* argv[]) {
+inline ServerConfig ParseCommandLine(int argc, char* argv[], bool& show_version) {
     ServerConfig config;
+    show_version = false;
+    std::string config_file_path;
 
+    // First pass: look for config file
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
+            config_file_path = argv[++i];
+        }
+    }
+
+    // Load config file if specified
+    if (!config_file_path.empty()) {
+        std::string error;
+        if (!config.LoadFromFile(config_file_path, error)) {
+            std::cerr << "Error loading config file: " << error << std::endl;
+            std::exit(1);
+        }
+        config.config_file = config_file_path;
+    }
+
+    // Second pass: command line overrides config file
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
         if (arg == "--help") {
             PrintUsage(argv[0]);
             std::exit(0);
+        } else if (arg == "--version") {
+            show_version = true;
+        } else if ((arg == "-c" || arg == "--config") && i + 1 < argc) {
+            ++i;  // Already processed
         } else if ((arg == "-h" || arg == "--host") && i + 1 < argc) {
             config.host = argv[++i];
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
             config.port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if ((arg == "-d" || arg == "--database") && i + 1 < argc) {
             config.database_path = argv[++i];
+        } else if (arg == "--daemon") {
+            config.daemon = true;
+        } else if (arg == "--pid-file" && i + 1 < argc) {
+            config.pid_file = argv[++i];
+        } else if (arg == "--user" && i + 1 < argc) {
+            config.user = argv[++i];
         } else if (arg == "--log-file" && i + 1 < argc) {
             config.log_file = argv[++i];
         } else if (arg == "--log-level" && i + 1 < argc) {
@@ -93,10 +180,24 @@ inline ServerConfig ParseCommandLine(int argc, char* argv[]) {
             config.executor_threads = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--max-connections" && i + 1 < argc) {
             config.max_connections = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if (arg == "--http-port" && i + 1 < argc) {
+            config.http_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--max-memory" && i + 1 < argc) {
+            config.max_memory = static_cast<uint64_t>(std::stoll(argv[++i]));
+        } else if (arg == "--max-open-files" && i + 1 < argc) {
+            config.max_open_files = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if (arg == "--query-timeout" && i + 1 < argc) {
+            config.query_timeout_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
         }
     }
 
     return config;
+}
+
+// Backward compatibility
+inline ServerConfig ParseCommandLine(int argc, char* argv[]) {
+    bool show_version;
+    return ParseCommandLine(argc, argv, show_version);
 }
 
 } // namespace duckdb_server

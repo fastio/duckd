@@ -8,6 +8,28 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Options
 option(BUILD_TESTS "Build tests" ON)
+option(WITH_SYSTEMD "Enable systemd integration" OFF)
+
+# Get git commit hash
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE DUCKD_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(NOT DUCKD_GIT_COMMIT)
+    set(DUCKD_GIT_COMMIT "unknown")
+endif()
+
+# Get build time
+string(TIMESTAMP DUCKD_BUILD_TIME "%Y-%m-%d %H:%M:%S")
+
+# Generate version header
+configure_file(
+    ${CMAKE_SOURCE_DIR}/src/version.hpp.in
+    ${CMAKE_BINARY_DIR}/generated/version.hpp
+)
 
 # Set source directory for subdirectory CMakeLists
 set(DUCKD_SOURCE_DIR ${CMAKE_SOURCE_DIR})
@@ -52,6 +74,6 @@ if(BUILD_TESTS)
 endif()
 
 # Install
-install(TARGETS duckd-server duckd-client
+install(TARGETS duckd-server duckd-cli
     RUNTIME DESTINATION bin
 )

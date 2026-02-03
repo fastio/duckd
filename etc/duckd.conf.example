@@ -1,0 +1,31 @@
+# DuckD Server Configuration File
+# Copy to /etc/duckd/duckd.conf or use -c/--config to specify path
+
+# Network settings
+host = 0.0.0.0
+port = 9999
+http_port = 8080  # Health/metrics endpoint (0 to disable)
+
+# Database
+database = /var/lib/duckd/data.duckdb
+# database = :memory:  # In-memory database
+
+# Logging
+log_file = /var/log/duckd/duckd.log
+log_level = info  # debug, info, warn, error
+
+# Process management
+pid_file = /var/run/duckd/duckd.pid
+# user = duckd  # User to run as (requires starting as root)
+# daemon = true  # Run as background daemon
+
+# Threading
+io_threads = 0        # 0 = auto (CPU cores / 2)
+executor_threads = 0  # 0 = auto (CPU cores)
+max_connections = 100
+session_timeout_minutes = 30
+
+# Resource limits
+# max_memory = 0       # 0 = unlimited (bytes)
+# max_open_files = 0   # 0 = system default
+query_timeout_ms = 300000  # 5 minutes

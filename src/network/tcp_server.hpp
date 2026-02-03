@@ -16,7 +16,7 @@
 
 namespace duckdb_server {
 
-class ServerConfig;
+struct ServerConfig;
 class SessionManager;
 class ExecutorPool;
 

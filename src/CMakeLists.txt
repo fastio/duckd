@@ -26,6 +26,9 @@ set(DUCKD_SERVER_SOURCES
     ${DUCKD_SRC_DIR}/executor/query_executor.cpp
     ${DUCKD_SRC_DIR}/executor/executor_pool.cpp
 
+    # HTTP
+    ${DUCKD_SRC_DIR}/http/http_server.cpp
+
     # Utils
     ${DUCKD_SRC_DIR}/utils/logger.cpp
 )
