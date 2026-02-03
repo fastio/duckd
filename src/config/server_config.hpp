@@ -16,11 +16,18 @@
 
 namespace duckdb_server {
 
+// Protocol type
+enum class ProtocolType {
+    Native,      // Custom DuckD protocol
+    PostgreSQL   // PostgreSQL wire protocol
+};
+
 struct ServerConfig {
     // Network
     std::string host = "0.0.0.0";
-    uint16_t port = 9999;
+    uint16_t port = 5432;  // Default to PostgreSQL port
     uint16_t http_port = 0;  // 0 = disabled, for health/metrics
+    ProtocolType protocol = ProtocolType::PostgreSQL;
 
     // Database
     std::string database_path = ":memory:";
@@ -96,6 +103,14 @@ struct ServerConfig {
         if (cfg.Has("max_memory")) max_memory = static_cast<uint64_t>(cfg.GetInt("max_memory"));
         if (cfg.Has("max_open_files")) max_open_files = static_cast<uint32_t>(cfg.GetInt("max_open_files"));
         if (cfg.Has("query_timeout_ms")) query_timeout_ms = static_cast<uint32_t>(cfg.GetInt("query_timeout_ms"));
+        if (cfg.Has("protocol")) {
+            std::string proto = cfg.GetString("protocol");
+            if (proto == "postgresql" || proto == "pg") {
+                protocol = ProtocolType::PostgreSQL;
+            } else if (proto == "native") {
+                protocol = ProtocolType::Native;
+            }
+        }
 
         return true;
     }
@@ -106,8 +121,9 @@ inline void PrintUsage(const char* program) {
               << "\nOptions:\n"
               << "  -c, --config <path>     Config file path\n"
               << "  -h, --host <host>       Host to bind (default: 0.0.0.0)\n"
-              << "  -p, --port <port>       Port to bind (default: 9999)\n"
+              << "  -p, --port <port>       Port to bind (default: 5432)\n"
               << "  -d, --database <path>   Database path (default: :memory:)\n"
+              << "  --protocol <type>       Protocol: postgresql (default), native\n"
               << "  --daemon                Run as daemon (background)\n"
               << "  --pid-file <path>       PID file path\n"
               << "  --user <name>           User to run as (drops privileges)\n"
@@ -188,6 +204,13 @@ inline ServerConfig ParseCommandLine(int argc, char* argv[], bool& show_version)
             config.max_open_files = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--query-timeout" && i + 1 < argc) {
             config.query_timeout_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if (arg == "--protocol" && i + 1 < argc) {
+            std::string proto = argv[++i];
+            if (proto == "postgresql" || proto == "pg") {
+                config.protocol = ProtocolType::PostgreSQL;
+            } else if (proto == "native") {
+                config.protocol = ProtocolType::Native;
+            }
         }
     }
 

@@ -8,12 +8,16 @@ set(DUCKD_SERVER_SOURCES
     ${DUCKD_SRC_DIR}/network/io_context_pool.cpp
     ${DUCKD_SRC_DIR}/network/tcp_server.cpp
     ${DUCKD_SRC_DIR}/network/tcp_connection.cpp
+    ${DUCKD_SRC_DIR}/network/pg_connection.cpp
 
-    # Protocol layer
+    # Protocol layer (native)
     ${DUCKD_SRC_DIR}/protocol/message.cpp
     ${DUCKD_SRC_DIR}/protocol/message_parser.cpp
     ${DUCKD_SRC_DIR}/protocol/message_builder.cpp
     ${DUCKD_SRC_DIR}/protocol/protocol_handler.cpp
+
+    # Protocol layer (PostgreSQL)
+    ${DUCKD_SRC_DIR}/protocol/pg/pg_handler.cpp
 
     # Session layer
     ${DUCKD_SRC_DIR}/session/session.cpp

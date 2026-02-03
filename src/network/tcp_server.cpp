@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "network/tcp_server.hpp"
+#include "network/pg_connection.hpp"
 #include "config/server_config.hpp"
 #include "protocol/protocol_handler.hpp"
 #include "session/session_manager.hpp"
@@ -64,8 +65,9 @@ void TcpServer::Start() {
         acceptor_io_context_.run();
     });
     
-    LOG_INFO("server", "DuckDB Server started on " + config_.host + ":" + 
-             std::to_string(config_.port));
+    std::string protocol_name = (config_.protocol == ProtocolType::PostgreSQL) ? "PostgreSQL" : "Native";
+    LOG_INFO("server", "DuckD Server started on " + config_.host + ":" +
+             std::to_string(config_.port) + " (" + protocol_name + " protocol)");
 }
 
 void TcpServer::Stop() {
@@ -119,47 +121,80 @@ void TcpServer::DoAccept() {
     if (!running_) {
         return;
     }
-    
+
     // Get next io_context for this connection
     asio::io_context& io_context = io_pool_.GetNextIoContext();
-    
-    // Create query executor and arrow serializer
-    auto arrow_serializer = std::make_shared<ArrowSerializer>();
-    auto query_executor = std::make_shared<QueryExecutor>(arrow_serializer);
-    
-    // Create protocol handler
-    auto handler = std::make_shared<ProtocolHandler>(
-        session_manager_,
-        executor_pool_,
-        query_executor
-    );
-    
-    // Create connection
-    auto conn = std::make_shared<TcpConnection>(io_context, *this, handler);
-    
-    acceptor_.async_accept(conn->GetSocket(),
-        [this, conn](const asio::error_code& ec) {
-            if (ec) {
-                if (running_) {
-                    LOG_WARN("server", "Accept error: " + ec.message());
-                    DoAccept();
+
+    if (config_.protocol == ProtocolType::PostgreSQL) {
+        // PostgreSQL protocol - create socket and accept
+        auto socket = std::make_shared<asio::ip::tcp::socket>(io_context);
+
+        acceptor_.async_accept(*socket,
+            [this, socket](const asio::error_code& ec) {
+                if (ec) {
+                    if (running_) {
+                        LOG_WARN("server", "Accept error: " + ec.message());
+                        DoAccept();
+                    }
+                    return;
                 }
-                return;
-            }
-            
-            // Check max connections
-            if (GetConnectionCount() >= config_.max_connections) {
-                LOG_WARN("server", "Max connections reached, rejecting new connection");
-                conn->Close();
-            } else {
-                // Add and start connection
-                AddConnection(conn);
-                conn->Start();
-            }
-            
-            // Accept next connection
-            DoAccept();
-        });
+
+                // Check max connections
+                if (GetConnectionCount() >= config_.max_connections) {
+                    LOG_WARN("server", "Max connections reached, rejecting new connection");
+                    socket->close();
+                } else {
+                    // Create session for this connection
+                    auto session = session_manager_->CreateSession();
+                    if (session) {
+                        auto pg_conn = PgConnection::Create(std::move(*socket), this, session);
+                        total_connections_++;
+                        pg_conn->Start();
+                    } else {
+                        LOG_WARN("server", "Failed to create session");
+                        socket->close();
+                    }
+                }
+
+                // Accept next connection
+                DoAccept();
+            });
+    } else {
+        // Native protocol
+        auto arrow_serializer = std::make_shared<ArrowSerializer>();
+        auto query_executor = std::make_shared<QueryExecutor>(arrow_serializer);
+
+        auto handler = std::make_shared<ProtocolHandler>(
+            session_manager_,
+            executor_pool_,
+            query_executor
+        );
+
+        auto conn = std::make_shared<TcpConnection>(io_context, *this, handler);
+
+        acceptor_.async_accept(conn->GetSocket(),
+            [this, conn](const asio::error_code& ec) {
+                if (ec) {
+                    if (running_) {
+                        LOG_WARN("server", "Accept error: " + ec.message());
+                        DoAccept();
+                    }
+                    return;
+                }
+
+                // Check max connections
+                if (GetConnectionCount() >= config_.max_connections) {
+                    LOG_WARN("server", "Max connections reached, rejecting new connection");
+                    conn->Close();
+                } else {
+                    AddConnection(conn);
+                    conn->Start();
+                }
+
+                // Accept next connection
+                DoAccept();
+            });
+    }
 }
 
 } // namespace duckdb_server
