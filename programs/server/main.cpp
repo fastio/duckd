@@ -18,6 +18,7 @@
 #include <csignal>
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
@@ -372,12 +373,20 @@ int main(int argc, char* argv[]) {
         LOG_INFO("main", "Opening database: " + g_config.database_path);
         auto db = std::make_shared<duckdb::DuckDB>(g_config.database_path);
 
-        // Create session manager
-        auto session_manager = std::make_shared<SessionManager>(
-            db,
-            g_config.max_connections,
-            std::chrono::minutes(g_config.session_timeout_minutes)
-        );
+        // Create session manager with connection pool
+        SessionManager::Config sm_config;
+        sm_config.max_sessions = g_config.max_connections;
+        sm_config.session_timeout = std::chrono::minutes(g_config.session_timeout_minutes);
+        sm_config.pool_min_connections = g_config.pool_min_connections;
+        sm_config.pool_max_connections = g_config.pool_max_connections;
+        sm_config.pool_idle_timeout = std::chrono::seconds(g_config.pool_idle_timeout_seconds);
+        sm_config.pool_acquire_timeout = std::chrono::milliseconds(g_config.pool_acquire_timeout_ms);
+        sm_config.pool_validate_on_acquire = g_config.pool_validate_on_acquire;
+
+        auto session_manager = std::make_shared<SessionManager>(db, sm_config);
+
+        LOG_INFO("main", "  Connection Pool: min=" + std::to_string(g_config.pool_min_connections) +
+                 ", max=" + std::to_string(g_config.pool_max_connections));
 
         // Create executor pool
         auto executor_pool = std::make_shared<ExecutorPool>(g_config.GetExecutorThreadCount());
@@ -390,6 +399,54 @@ int main(int argc, char* argv[]) {
         // Start HTTP server for health/metrics
         if (g_config.http_port > 0) {
             g_http_server = std::make_shared<HttpServer>(g_config.http_port, g_server.get());
+
+            // Add connection pool metrics
+            g_http_server->SetMetricsCallback([session_manager]() -> std::string {
+                auto stats = session_manager->GetPoolStats();
+                std::ostringstream metrics;
+                metrics << "\n"
+                        << "# HELP duckd_pool_connections_total Total connections created by pool\n"
+                        << "# TYPE duckd_pool_connections_total counter\n"
+                        << "duckd_pool_connections_total " << stats.total_created << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_connections_destroyed Total connections destroyed by pool\n"
+                        << "# TYPE duckd_pool_connections_destroyed counter\n"
+                        << "duckd_pool_connections_destroyed " << stats.total_destroyed << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_connections_current Current pool size\n"
+                        << "# TYPE duckd_pool_connections_current gauge\n"
+                        << "duckd_pool_connections_current " << stats.current_size << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_connections_available Available connections in pool\n"
+                        << "# TYPE duckd_pool_connections_available gauge\n"
+                        << "duckd_pool_connections_available " << stats.available << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_connections_in_use Connections currently in use\n"
+                        << "# TYPE duckd_pool_connections_in_use gauge\n"
+                        << "duckd_pool_connections_in_use " << stats.in_use << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_acquire_total Total connection acquire requests\n"
+                        << "# TYPE duckd_pool_acquire_total counter\n"
+                        << "duckd_pool_acquire_total " << stats.acquire_count << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_acquire_timeout_total Acquire requests that timed out\n"
+                        << "# TYPE duckd_pool_acquire_timeout_total counter\n"
+                        << "duckd_pool_acquire_timeout_total " << stats.acquire_timeout_count << "\n"
+                        << "\n"
+                        << "# HELP duckd_pool_validation_failures_total Connection validation failures\n"
+                        << "# TYPE duckd_pool_validation_failures_total counter\n"
+                        << "duckd_pool_validation_failures_total " << stats.validation_failure_count << "\n"
+                        << "\n"
+                        << "# HELP duckd_sessions_active Current active sessions\n"
+                        << "# TYPE duckd_sessions_active gauge\n"
+                        << "duckd_sessions_active " << session_manager->GetActiveSessionCount() << "\n"
+                        << "\n"
+                        << "# HELP duckd_sessions_total Total sessions created\n"
+                        << "# TYPE duckd_sessions_total counter\n"
+                        << "duckd_sessions_total " << session_manager->GetTotalSessionsCreated() << "\n";
+                return metrics.str();
+            });
+
             g_http_server->Start();
         }
 

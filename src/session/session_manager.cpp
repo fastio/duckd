@@ -1,9 +1,9 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB Server
+//                         DuckD Server
 //
 // session/session_manager.cpp
 //
-// Session manager implementation
+// Session manager implementation with connection pooling
 //===----------------------------------------------------------------------===//
 
 #include "session/session_manager.hpp"
@@ -12,17 +12,54 @@
 namespace duckdb_server {
 
 SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db,
-                               size_t max_sessions,
-                               std::chrono::minutes session_timeout)
+                               const Config& config)
     : db_(db)
-    , max_sessions_(max_sessions)
-    , session_timeout_(session_timeout)
+    , config_(config)
     , next_session_id_(1)
     , total_sessions_created_(0)
     , cleanup_running_(false) {
-    
+
+    // Create connection pool
+    ConnectionPool::Config pool_config;
+    pool_config.min_connections = config.pool_min_connections;
+    pool_config.max_connections = config.pool_max_connections;
+    pool_config.idle_timeout = config.pool_idle_timeout;
+    pool_config.acquire_timeout = config.pool_acquire_timeout;
+    pool_config.validate_on_acquire = config.pool_validate_on_acquire;
+
+    connection_pool_ = std::make_unique<ConnectionPool>(db_->instance, pool_config);
+
     // Start cleanup thread
     StartCleanupTimer();
+
+    LOG_INFO("session_manager", "Session manager initialized (max_sessions=" +
+             std::to_string(config_.max_sessions) + ")");
+}
+
+// Legacy constructor
+SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db,
+                               size_t max_sessions,
+                               std::chrono::minutes session_timeout)
+    : db_(db)
+    , next_session_id_(1)
+    , total_sessions_created_(0)
+    , cleanup_running_(false) {
+
+    config_.max_sessions = max_sessions;
+    config_.session_timeout = session_timeout;
+
+    // Create connection pool with defaults based on max_sessions
+    ConnectionPool::Config pool_config;
+    pool_config.min_connections = std::min(size_t(5), max_sessions / 4 + 1);
+    pool_config.max_connections = max_sessions;
+
+    connection_pool_ = std::make_unique<ConnectionPool>(db_->instance, pool_config);
+
+    // Start cleanup thread
+    StartCleanupTimer();
+
+    LOG_INFO("session_manager", "Session manager initialized (legacy mode, max_sessions=" +
+             std::to_string(max_sessions) + ")");
 }
 
 SessionManager::~SessionManager() {
@@ -30,85 +67,97 @@ SessionManager::~SessionManager() {
     if (cleanup_thread_.joinable()) {
         cleanup_thread_.join();
     }
-    
-    // Clear all sessions
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-    sessions_.clear();
+
+    // Clear all sessions (will return connections to pool)
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        sessions_.clear();
+    }
+
+    // Connection pool will be destroyed after sessions
+    LOG_INFO("session_manager", "Session manager shutdown");
 }
 
 SessionPtr SessionManager::CreateSession() {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
-    
+
     // Check max sessions
-    if (sessions_.size() >= max_sessions_) {
-        LOG_WARN("session_manager", "Maximum sessions reached: " + 
-                 std::to_string(max_sessions_));
+    if (sessions_.size() >= config_.max_sessions) {
+        LOG_WARN("session_manager", "Maximum sessions reached: " +
+                 std::to_string(config_.max_sessions));
         return nullptr;
     }
-    
+
+    // Acquire connection from pool
+    auto pooled_conn = connection_pool_->Acquire();
+    if (!pooled_conn) {
+        LOG_WARN("session_manager", "Failed to acquire connection from pool");
+        return nullptr;
+    }
+
     // Generate session ID
     uint64_t session_id = NextSessionId();
-    
-    // Create session
-    auto session = std::make_shared<Session>(session_id, db_->instance);
-    
+
+    // Create session with pooled connection
+    auto session = std::make_shared<Session>(session_id, std::move(pooled_conn));
+
     // Store
     sessions_[session_id] = session;
     total_sessions_created_++;
-    
-    LOG_DEBUG("session_manager", "Created session " + std::to_string(session_id) + 
+
+    LOG_DEBUG("session_manager", "Created session " + std::to_string(session_id) +
               " (total: " + std::to_string(sessions_.size()) + ")");
-    
+
     return session;
 }
 
 SessionPtr SessionManager::GetSession(uint64_t session_id) {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
-    
+
     auto it = sessions_.find(session_id);
     if (it != sessions_.end()) {
         return it->second;
     }
-    
+
     return nullptr;
 }
 
 bool SessionManager::RemoveSession(uint64_t session_id) {
     std::lock_guard<std::mutex> lock(sessions_mutex_);
-    
+
     auto it = sessions_.find(session_id);
     if (it != sessions_.end()) {
         sessions_.erase(it);
-        LOG_DEBUG("session_manager", "Removed session " + std::to_string(session_id) + 
+        LOG_DEBUG("session_manager", "Removed session " + std::to_string(session_id) +
                   " (total: " + std::to_string(sessions_.size()) + ")");
         return true;
     }
-    
+
     return false;
 }
 
 size_t SessionManager::CleanupExpiredSessions() {
     std::vector<uint64_t> expired;
-    
+
     {
         std::lock_guard<std::mutex> lock(sessions_mutex_);
-        
+
         for (const auto& [id, session] : sessions_) {
-            if (session->IsExpired(session_timeout_)) {
+            if (session->IsExpired(config_.session_timeout)) {
                 expired.push_back(id);
             }
         }
-        
+
         for (uint64_t id : expired) {
             sessions_.erase(id);
         }
     }
-    
+
     if (!expired.empty()) {
-        LOG_INFO("session_manager", "Cleaned up " + std::to_string(expired.size()) + 
+        LOG_INFO("session_manager", "Cleaned up " + std::to_string(expired.size()) +
                  " expired sessions");
     }
-    
+
     return expired.size();
 }
 
@@ -117,20 +166,24 @@ size_t SessionManager::GetActiveSessionCount() const {
     return sessions_.size();
 }
 
+ConnectionPool::Stats SessionManager::GetPoolStats() const {
+    return connection_pool_->GetStats();
+}
+
 uint64_t SessionManager::NextSessionId() {
     return next_session_id_.fetch_add(1);
 }
 
 void SessionManager::StartCleanupTimer() {
     cleanup_running_ = true;
-    
+
     cleanup_thread_ = std::thread([this]() {
         while (cleanup_running_) {
             // Sleep for 1 minute
             for (int i = 0; i < 60 && cleanup_running_; ++i) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-            
+
             if (cleanup_running_) {
                 CleanupExpiredSessions();
             }

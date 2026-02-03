@@ -53,6 +53,13 @@ struct ServerConfig {
     uint32_t max_open_files = 0;  // 0 = system default
     uint32_t query_timeout_ms = 300000;  // 5 minutes
 
+    // Connection pool settings
+    uint32_t pool_min_connections = 5;
+    uint32_t pool_max_connections = 50;
+    uint32_t pool_idle_timeout_seconds = 300;
+    uint32_t pool_acquire_timeout_ms = 5000;
+    bool pool_validate_on_acquire = true;
+
     uint32_t GetIoThreadCount() const {
         if (io_threads == 0) {
             return std::max(1u, std::thread::hardware_concurrency() / 2);
@@ -103,6 +110,11 @@ struct ServerConfig {
         if (cfg.Has("max_memory")) max_memory = static_cast<uint64_t>(cfg.GetInt("max_memory"));
         if (cfg.Has("max_open_files")) max_open_files = static_cast<uint32_t>(cfg.GetInt("max_open_files"));
         if (cfg.Has("query_timeout_ms")) query_timeout_ms = static_cast<uint32_t>(cfg.GetInt("query_timeout_ms"));
+        if (cfg.Has("pool_min_connections")) pool_min_connections = static_cast<uint32_t>(cfg.GetInt("pool_min_connections"));
+        if (cfg.Has("pool_max_connections")) pool_max_connections = static_cast<uint32_t>(cfg.GetInt("pool_max_connections"));
+        if (cfg.Has("pool_idle_timeout")) pool_idle_timeout_seconds = static_cast<uint32_t>(cfg.GetInt("pool_idle_timeout"));
+        if (cfg.Has("pool_acquire_timeout")) pool_acquire_timeout_ms = static_cast<uint32_t>(cfg.GetInt("pool_acquire_timeout"));
+        if (cfg.Has("pool_validate_on_acquire")) pool_validate_on_acquire = cfg.GetBool("pool_validate_on_acquire");
         if (cfg.Has("protocol")) {
             std::string proto = cfg.GetString("protocol");
             if (proto == "postgresql" || proto == "pg") {
@@ -136,6 +148,9 @@ inline void PrintUsage(const char* program) {
               << "  --max-memory <bytes>    Max memory limit (default: unlimited)\n"
               << "  --max-open-files <n>    Max open file descriptors\n"
               << "  --query-timeout <ms>    Query timeout in milliseconds (default: 300000)\n"
+              << "  --pool-min <n>          Pool minimum connections (default: 5)\n"
+              << "  --pool-max <n>          Pool maximum connections (default: 50)\n"
+              << "  --pool-idle-timeout <s> Pool idle connection timeout in seconds (default: 300)\n"
               << "  --version               Show version info\n"
               << "  --help                  Show this help\n";
 }
@@ -211,6 +226,12 @@ inline ServerConfig ParseCommandLine(int argc, char* argv[], bool& show_version)
             } else if (proto == "native") {
                 config.protocol = ProtocolType::Native;
             }
+        } else if (arg == "--pool-min" && i + 1 < argc) {
+            config.pool_min_connections = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if (arg == "--pool-max" && i + 1 < argc) {
+            config.pool_max_connections = static_cast<uint32_t>(std::stoi(argv[++i]));
+        } else if (arg == "--pool-idle-timeout" && i + 1 < argc) {
+            config.pool_idle_timeout_seconds = static_cast<uint32_t>(std::stoi(argv[++i]));
         }
     }
 

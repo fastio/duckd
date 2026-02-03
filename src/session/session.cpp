@@ -1,5 +1,5 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB Server
+//                         DuckD Server
 //
 // session/session.cpp
 //
@@ -8,14 +8,28 @@
 
 #include "session/session.hpp"
 #include "utils/logger.hpp"
+#include <stdexcept>
 
 namespace duckdb_server {
 
+// Constructor with pooled connection
+Session::Session(uint64_t session_id, PooledConnection connection)
+    : session_id_(session_id)
+    , created_at_(Clock::now())
+    , last_active_(Clock::now())
+    , pooled_connection_(std::move(connection))
+    , current_database_("main")
+    , current_schema_("main")
+    , current_query_id_(0)
+    , cancel_requested_(false) {
+}
+
+// Legacy constructor (creates own connection)
 Session::Session(uint64_t session_id, duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance)
     : session_id_(session_id)
     , created_at_(Clock::now())
     , last_active_(Clock::now())
-    , connection_(std::make_unique<duckdb::Connection>(*db_instance))
+    , owned_connection_(std::make_unique<duckdb::Connection>(*db_instance))
     , current_database_("main")
     , current_schema_("main")
     , current_query_id_(0)
@@ -24,6 +38,21 @@ Session::Session(uint64_t session_id, duckdb::shared_ptr<duckdb::DatabaseInstanc
 
 Session::~Session() {
     ClearPreparedStatements();
+    // PooledConnection will automatically return to pool in its destructor
+}
+
+duckdb::Connection& Session::GetConnection() {
+    if (pooled_connection_) {
+        return *pooled_connection_;
+    }
+    if (owned_connection_) {
+        return *owned_connection_;
+    }
+    throw std::runtime_error("Session has no valid connection");
+}
+
+bool Session::HasConnection() const {
+    return static_cast<bool>(pooled_connection_) || static_cast<bool>(owned_connection_);
 }
 
 void Session::AddPreparedStatement(const std::string& name,

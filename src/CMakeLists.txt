@@ -22,6 +22,7 @@ set(DUCKD_SERVER_SOURCES
     # Session layer
     ${DUCKD_SRC_DIR}/session/session.cpp
     ${DUCKD_SRC_DIR}/session/session_manager.cpp
+    ${DUCKD_SRC_DIR}/session/connection_pool.cpp
 
     # Serialization
     ${DUCKD_SRC_DIR}/serialization/arrow_serializer.cpp
