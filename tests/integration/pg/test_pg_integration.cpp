@@ -1,0 +1,867 @@
+//===----------------------------------------------------------------------===//
+//                         DuckD Server - Integration Tests
+//
+// tests/integration/pg/test_pg_integration.cpp
+//
+// End-to-end integration tests for PostgreSQL protocol
+//===----------------------------------------------------------------------===//
+
+#include "protocol/pg/pg_handler.hpp"
+#include "protocol/pg/pg_protocol.hpp"
+#include "protocol/pg/pg_message_reader.hpp"
+#include "session/session.hpp"
+#include "duckdb.hpp"
+#include <cassert>
+#include <iostream>
+#include <cstring>
+#include <functional>
+
+using namespace duckdb_server;
+using namespace duckdb_server::pg;
+
+//===----------------------------------------------------------------------===//
+// Test Fixture
+//===----------------------------------------------------------------------===//
+
+class PgProtocolTest {
+public:
+    PgProtocolTest() {
+        // Create in-memory DuckDB database
+        db_ = std::make_unique<duckdb::DuckDB>(nullptr);
+
+        // Create session with session_id and db instance
+        session_ = std::make_shared<Session>(1, db_->instance);
+
+        // Create handler with send callback
+        handler_ = std::make_unique<PgHandler>(session_,
+            [this](const std::vector<uint8_t>& data) {
+                received_data_.insert(received_data_.end(), data.begin(), data.end());
+            });
+    }
+
+    void ClearReceived() {
+        received_data_.clear();
+    }
+
+    // Send startup message
+    bool SendStartup(const std::string& user = "test", const std::string& database = "test") {
+        std::vector<uint8_t> buf;
+
+        // Length placeholder
+        size_t length_pos = buf.size();
+        WriteInt32(buf, 0);
+
+        // Protocol version 3.0
+        WriteInt32(buf, PROTOCOL_VERSION_3_0);
+
+        // Parameters
+        WriteString(buf, "user");
+        WriteString(buf, user);
+        WriteString(buf, "database");
+        WriteString(buf, database);
+        buf.push_back(0);
+
+        // Update length
+        int32_t length = static_cast<int32_t>(buf.size());
+        int32_t network_length = HostToNetwork32(length);
+        std::memcpy(buf.data() + length_pos, &network_length, 4);
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send simple query
+    bool SendQuery(const std::string& sql) {
+        std::vector<uint8_t> buf;
+        buf.push_back('Q');
+
+        // Length
+        int32_t length = static_cast<int32_t>(4 + sql.size() + 1);
+        WriteInt32(buf, length);
+
+        // Query string
+        WriteString(buf, sql);
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Parse message
+    bool SendParse(const std::string& name, const std::string& query,
+                   const std::vector<int32_t>& param_types = {}) {
+        std::vector<uint8_t> buf;
+        buf.push_back('P');
+
+        // Build body first
+        std::vector<uint8_t> body;
+        WriteString(body, name);
+        WriteString(body, query);
+        WriteInt16(body, static_cast<int16_t>(param_types.size()));
+        for (int32_t oid : param_types) {
+            WriteInt32(body, oid);
+        }
+
+        // Length
+        int32_t length = static_cast<int32_t>(4 + body.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), body.begin(), body.end());
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Bind message
+    bool SendBind(const std::string& portal, const std::string& statement,
+                  const std::vector<std::string>& params = {}) {
+        std::vector<uint8_t> buf;
+        buf.push_back('B');
+
+        std::vector<uint8_t> body;
+        WriteString(body, portal);
+        WriteString(body, statement);
+
+        // Parameter format codes (all text)
+        WriteInt16(body, 0);
+
+        // Parameter values
+        WriteInt16(body, static_cast<int16_t>(params.size()));
+        for (const auto& param : params) {
+            WriteInt32(body, static_cast<int32_t>(param.size()));
+            body.insert(body.end(), param.begin(), param.end());
+        }
+
+        // Result format codes (all text)
+        WriteInt16(body, 0);
+
+        int32_t length = static_cast<int32_t>(4 + body.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), body.begin(), body.end());
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Describe message
+    bool SendDescribe(char type, const std::string& name) {
+        std::vector<uint8_t> buf;
+        buf.push_back('D');
+
+        std::vector<uint8_t> body;
+        body.push_back(static_cast<uint8_t>(type));
+        WriteString(body, name);
+
+        int32_t length = static_cast<int32_t>(4 + body.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), body.begin(), body.end());
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Execute message
+    bool SendExecute(const std::string& portal, int32_t max_rows = 0) {
+        std::vector<uint8_t> buf;
+        buf.push_back('E');
+
+        std::vector<uint8_t> body;
+        WriteString(body, portal);
+        WriteInt32(body, max_rows);
+
+        int32_t length = static_cast<int32_t>(4 + body.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), body.begin(), body.end());
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Sync message
+    bool SendSync() {
+        std::vector<uint8_t> buf = {'S', 0, 0, 0, 4};
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Close message
+    bool SendClose(char type, const std::string& name) {
+        std::vector<uint8_t> buf;
+        buf.push_back('C');
+
+        std::vector<uint8_t> body;
+        body.push_back(static_cast<uint8_t>(type));
+        WriteString(body, name);
+
+        int32_t length = static_cast<int32_t>(4 + body.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), body.begin(), body.end());
+
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Send Terminate
+    bool SendTerminate() {
+        std::vector<uint8_t> buf = {'X', 0, 0, 0, 4};
+        return handler_->ProcessData(buf.data(), buf.size());
+    }
+
+    // Check if received data contains message type
+    bool HasMessageType(char type) const {
+        for (size_t i = 0; i < received_data_.size(); ) {
+            if (received_data_[i] == static_cast<uint8_t>(type)) {
+                return true;
+            }
+            if (i + 5 > received_data_.size()) break;
+            int32_t len;
+            std::memcpy(&len, received_data_.data() + i + 1, 4);
+            len = NetworkToHost32(len);
+            i += 1 + len;
+        }
+        return false;
+    }
+
+    // Extract CommandComplete tag
+    std::string GetCommandCompleteTag() const {
+        for (size_t i = 0; i < received_data_.size(); ) {
+            char type = static_cast<char>(received_data_[i]);
+            if (i + 5 > received_data_.size()) break;
+            int32_t len;
+            std::memcpy(&len, received_data_.data() + i + 1, 4);
+            len = NetworkToHost32(len);
+
+            if (type == 'C') {
+                std::string tag(reinterpret_cast<const char*>(received_data_.data() + i + 5));
+                return tag;
+            }
+
+            i += 1 + len;
+        }
+        return "";
+    }
+
+    // Get ReadyForQuery status
+    char GetReadyForQueryStatus() const {
+        for (size_t i = 0; i < received_data_.size(); ) {
+            char type = static_cast<char>(received_data_[i]);
+            if (i + 5 > received_data_.size()) break;
+            int32_t len;
+            std::memcpy(&len, received_data_.data() + i + 1, 4);
+            len = NetworkToHost32(len);
+
+            if (type == 'Z' && len == 5) {
+                return static_cast<char>(received_data_[i + 5]);
+            }
+
+            i += 1 + len;
+        }
+        return '\0';
+    }
+
+    // Count DataRow messages
+    int CountDataRows() const {
+        int count = 0;
+        for (size_t i = 0; i < received_data_.size(); ) {
+            char type = static_cast<char>(received_data_[i]);
+            if (i + 5 > received_data_.size()) break;
+            int32_t len;
+            std::memcpy(&len, received_data_.data() + i + 1, 4);
+            len = NetworkToHost32(len);
+
+            if (type == 'D') {
+                count++;
+            }
+
+            i += 1 + len;
+        }
+        return count;
+    }
+
+    PgConnectionState GetState() const {
+        return handler_->GetState();
+    }
+
+private:
+    void WriteInt32(std::vector<uint8_t>& buf, int32_t value) {
+        int32_t network = HostToNetwork32(value);
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&network);
+        buf.insert(buf.end(), ptr, ptr + 4);
+    }
+
+    void WriteInt16(std::vector<uint8_t>& buf, int16_t value) {
+        int16_t network = HostToNetwork16(value);
+        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&network);
+        buf.insert(buf.end(), ptr, ptr + 2);
+    }
+
+    void WriteString(std::vector<uint8_t>& buf, const std::string& str) {
+        buf.insert(buf.end(), str.begin(), str.end());
+        buf.push_back(0);
+    }
+
+    std::unique_ptr<duckdb::DuckDB> db_;
+    std::shared_ptr<Session> session_;
+    std::unique_ptr<PgHandler> handler_;
+    std::vector<uint8_t> received_data_;
+};
+
+//===----------------------------------------------------------------------===//
+// Connection Tests
+//===----------------------------------------------------------------------===//
+
+void TestStartupHandshake() {
+    std::cout << "  Testing Startup Handshake..." << std::endl;
+
+    PgProtocolTest test;
+    assert(test.SendStartup("testuser", "testdb"));
+
+    // Should receive AuthenticationOk, ParameterStatus, BackendKeyData, ReadyForQuery
+    assert(test.HasMessageType('R'));  // Authentication
+    assert(test.HasMessageType('S'));  // ParameterStatus
+    assert(test.HasMessageType('K'));  // BackendKeyData
+    assert(test.HasMessageType('Z'));  // ReadyForQuery
+    assert(test.GetReadyForQueryStatus() == 'I');  // Idle
+    assert(test.GetState() == PgConnectionState::Ready);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestTerminateConnection() {
+    std::cout << "  Testing Terminate Connection..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(!test.SendTerminate());  // Returns false to close connection
+    assert(test.GetState() == PgConnectionState::Closed);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Simple Query Protocol Tests
+//===----------------------------------------------------------------------===//
+
+void TestSimpleQuerySelect() {
+    std::cout << "  Testing Simple Query SELECT..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT 1 + 1 as result"));
+
+    assert(test.HasMessageType('T'));  // RowDescription
+    assert(test.HasMessageType('D'));  // DataRow
+    assert(test.HasMessageType('C'));  // CommandComplete
+    assert(test.HasMessageType('Z'));  // ReadyForQuery
+    assert(test.GetCommandCompleteTag() == "SELECT 1");
+    assert(test.CountDataRows() == 1);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryCreateTable() {
+    std::cout << "  Testing Simple Query CREATE TABLE..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("CREATE TABLE test_table (id INTEGER, name VARCHAR)"));
+
+    assert(test.HasMessageType('C'));
+    assert(test.HasMessageType('Z'));
+    assert(test.GetCommandCompleteTag() == "CREATE TABLE");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryInsert() {
+    std::cout << "  Testing Simple Query INSERT..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE users (id INTEGER, name VARCHAR)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')"));
+
+    assert(test.HasMessageType('C'));
+    assert(test.HasMessageType('Z'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryMultipleRows() {
+    std::cout << "  Testing Simple Query Multiple Rows..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE items (id INTEGER)");
+    test.SendQuery("INSERT INTO items VALUES (1), (2), (3), (4), (5)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT * FROM items"));
+
+    assert(test.CountDataRows() == 5);
+    assert(test.GetCommandCompleteTag() == "SELECT 5");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryUpdate() {
+    std::cout << "  Testing Simple Query UPDATE..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE counters (id INTEGER, count INTEGER)");
+    test.SendQuery("INSERT INTO counters VALUES (1, 10), (2, 20)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("UPDATE counters SET count = count + 1 WHERE id = 1"));
+
+    assert(test.HasMessageType('C'));
+    // DuckDB returns affected rows via RowDescription/DataRow
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryDelete() {
+    std::cout << "  Testing Simple Query DELETE..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE to_delete (id INTEGER)");
+    test.SendQuery("INSERT INTO to_delete VALUES (1), (2), (3)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("DELETE FROM to_delete WHERE id > 1"));
+
+    assert(test.HasMessageType('C'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryEmptyQuery() {
+    std::cout << "  Testing Simple Query Empty..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery(""));
+
+    assert(test.HasMessageType('I'));  // EmptyQueryResponse
+    assert(test.HasMessageType('Z'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSimpleQueryError() {
+    std::cout << "  Testing Simple Query Error..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT * FROM nonexistent_table"));
+
+    assert(test.HasMessageType('E'));  // ErrorResponse
+    assert(test.HasMessageType('Z'));
+    assert(test.GetReadyForQueryStatus() == 'I');  // Back to Idle
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Extended Query Protocol Tests
+//===----------------------------------------------------------------------===//
+
+void TestExtendedQueryParse() {
+    std::cout << "  Testing Extended Query Parse..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendParse("stmt1", "SELECT 1"));
+
+    assert(test.HasMessageType('1'));  // ParseComplete
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestExtendedQueryBindExecute() {
+    std::cout << "  Testing Extended Query Bind/Execute..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendParse("stmt1", "SELECT $1::INTEGER + $2::INTEGER as sum");
+    test.ClearReceived();
+
+    assert(test.SendBind("portal1", "stmt1", {"10", "20"}));
+    assert(test.HasMessageType('2'));  // BindComplete
+    test.ClearReceived();
+
+    assert(test.SendExecute("portal1"));
+    assert(test.HasMessageType('D'));  // DataRow
+    assert(test.HasMessageType('C'));  // CommandComplete
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestExtendedQueryDescribe() {
+    std::cout << "  Testing Extended Query Describe..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    test.SendQuery("CREATE TABLE describe_test (id INTEGER, name VARCHAR, active BOOLEAN)");
+    test.ClearReceived();
+
+    test.SendParse("desc_stmt", "SELECT * FROM describe_test");
+    test.ClearReceived();
+
+    assert(test.SendDescribe('S', "desc_stmt"));
+    assert(test.HasMessageType('t'));  // ParameterDescription
+    assert(test.HasMessageType('T'));  // RowDescription
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestExtendedQueryClose() {
+    std::cout << "  Testing Extended Query Close..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendParse("to_close", "SELECT 1");
+    test.ClearReceived();
+
+    assert(test.SendClose('S', "to_close"));
+    assert(test.HasMessageType('3'));  // CloseComplete
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestExtendedQuerySync() {
+    std::cout << "  Testing Extended Query Sync..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendSync());
+    assert(test.HasMessageType('Z'));  // ReadyForQuery
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestExtendedQueryFullCycle() {
+    std::cout << "  Testing Extended Query Full Cycle..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    // Create table
+    test.SendQuery("CREATE TABLE ext_test (id INTEGER, value VARCHAR)");
+    test.SendQuery("INSERT INTO ext_test VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+    test.ClearReceived();
+
+    // Parse
+    test.SendParse("select_stmt", "SELECT * FROM ext_test WHERE id > $1::INTEGER");
+    assert(test.HasMessageType('1'));
+    test.ClearReceived();
+
+    // Bind
+    test.SendBind("", "select_stmt", {"1"});
+    assert(test.HasMessageType('2'));
+    test.ClearReceived();
+
+    // Execute
+    test.SendExecute("");
+    assert(test.CountDataRows() == 2);  // id=2 and id=3
+    test.ClearReceived();
+
+    // Sync
+    test.SendSync();
+    assert(test.HasMessageType('Z'));
+
+    // Close
+    test.ClearReceived();
+    test.SendClose('S', "select_stmt");
+    assert(test.HasMessageType('3'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// SQL Feature Tests
+//===----------------------------------------------------------------------===//
+
+void TestSQLDataTypes() {
+    std::cout << "  Testing SQL Data Types..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE types_test ("
+                   "  bool_col BOOLEAN,"
+                   "  int_col INTEGER,"
+                   "  bigint_col BIGINT,"
+                   "  float_col FLOAT,"
+                   "  double_col DOUBLE,"
+                   "  varchar_col VARCHAR,"
+                   "  date_col DATE,"
+                   "  timestamp_col TIMESTAMP"
+                   ")");
+    test.ClearReceived();
+
+    test.SendQuery("INSERT INTO types_test VALUES ("
+                   "  true, 42, 9223372036854775807, 3.14, 2.718281828,"
+                   "  'hello world', '2024-01-15', '2024-01-15 10:30:00'"
+                   ")");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT * FROM types_test"));
+    assert(test.HasMessageType('T'));
+    assert(test.CountDataRows() == 1);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLNullHandling() {
+    std::cout << "  Testing SQL NULL Handling..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE null_test (id INTEGER, value VARCHAR)");
+    test.SendQuery("INSERT INTO null_test VALUES (1, NULL), (2, 'not null'), (NULL, 'null id')");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT * FROM null_test"));
+    assert(test.CountDataRows() == 3);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLAggregation() {
+    std::cout << "  Testing SQL Aggregation..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE agg_test (category VARCHAR, amount DOUBLE)");
+    test.SendQuery("INSERT INTO agg_test VALUES "
+                   "('A', 10), ('A', 20), ('B', 15), ('B', 25), ('B', 30)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT category, SUM(amount), AVG(amount), COUNT(*) "
+                          "FROM agg_test GROUP BY category ORDER BY category"));
+    assert(test.CountDataRows() == 2);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLJoin() {
+    std::cout << "  Testing SQL JOIN..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE join_users (id INTEGER PRIMARY KEY, name VARCHAR)");
+    test.SendQuery("CREATE TABLE join_orders (id INTEGER, user_id INTEGER, amount DOUBLE)");
+    test.SendQuery("INSERT INTO join_users VALUES (1, 'Alice'), (2, 'Bob')");
+    test.SendQuery("INSERT INTO join_orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT u.name, SUM(o.amount) as total "
+                          "FROM join_users u "
+                          "JOIN join_orders o ON u.id = o.user_id "
+                          "GROUP BY u.name ORDER BY u.name"));
+    assert(test.CountDataRows() == 2);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLSubquery() {
+    std::cout << "  Testing SQL Subquery..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE subq_test (id INTEGER, value INTEGER)");
+    test.SendQuery("INSERT INTO subq_test VALUES (1, 10), (2, 20), (3, 30), (4, 40)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT * FROM subq_test WHERE value > "
+                          "(SELECT AVG(value) FROM subq_test)"));
+    assert(test.CountDataRows() == 2);  // 30 and 40 are above avg of 25
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLCTE() {
+    std::cout << "  Testing SQL CTE (WITH clause)..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("WITH numbers AS ("
+                          "  SELECT 1 as n UNION ALL SELECT 2 UNION ALL SELECT 3"
+                          ") SELECT SUM(n) FROM numbers"));
+    assert(test.CountDataRows() == 1);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLWindowFunction() {
+    std::cout << "  Testing SQL Window Function..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE window_test (dept VARCHAR, employee VARCHAR, salary INTEGER)");
+    test.SendQuery("INSERT INTO window_test VALUES "
+                   "('Sales', 'Alice', 50000), ('Sales', 'Bob', 60000), "
+                   "('Engineering', 'Charlie', 70000), ('Engineering', 'David', 80000)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT dept, employee, salary, "
+                          "RANK() OVER (PARTITION BY dept ORDER BY salary DESC) as rank "
+                          "FROM window_test ORDER BY dept, rank"));
+    assert(test.CountDataRows() == 4);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Error Handling Tests
+//===----------------------------------------------------------------------===//
+
+void TestSQLSyntaxError() {
+    std::cout << "  Testing SQL Syntax Error..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELEC * FROM table"));  // Typo in SELECT
+
+    assert(test.HasMessageType('E'));
+    assert(test.HasMessageType('Z'));
+    assert(test.GetState() == PgConnectionState::Ready);  // Should remain usable
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLConstraintViolation() {
+    std::cout << "  Testing SQL Constraint Violation..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE pk_test (id INTEGER PRIMARY KEY)");
+    test.SendQuery("INSERT INTO pk_test VALUES (1)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("INSERT INTO pk_test VALUES (1)"));  // Duplicate PK
+
+    assert(test.HasMessageType('E'));
+    assert(test.HasMessageType('Z'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLTableNotFound() {
+    std::cout << "  Testing SQL Table Not Found..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT * FROM does_not_exist"));
+
+    assert(test.HasMessageType('E'));
+    assert(test.HasMessageType('Z'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestSQLColumnNotFound() {
+    std::cout << "  Testing SQL Column Not Found..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendQuery("CREATE TABLE col_test (id INTEGER)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("SELECT nonexistent_column FROM col_test"));
+
+    assert(test.HasMessageType('E'));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Main
+//===----------------------------------------------------------------------===//
+
+int main() {
+    std::cout << "=== PostgreSQL Protocol Integration Tests ===" << std::endl;
+
+    std::cout << "\n1. Connection Tests:" << std::endl;
+    TestStartupHandshake();
+    TestTerminateConnection();
+
+    std::cout << "\n2. Simple Query Protocol:" << std::endl;
+    TestSimpleQuerySelect();
+    TestSimpleQueryCreateTable();
+    TestSimpleQueryInsert();
+    TestSimpleQueryMultipleRows();
+    TestSimpleQueryUpdate();
+    TestSimpleQueryDelete();
+    TestSimpleQueryEmptyQuery();
+    TestSimpleQueryError();
+
+    std::cout << "\n3. Extended Query Protocol:" << std::endl;
+    TestExtendedQueryParse();
+    TestExtendedQueryBindExecute();
+    TestExtendedQueryDescribe();
+    TestExtendedQueryClose();
+    TestExtendedQuerySync();
+    TestExtendedQueryFullCycle();
+
+    std::cout << "\n4. SQL Feature Tests:" << std::endl;
+    TestSQLDataTypes();
+    TestSQLNullHandling();
+    TestSQLAggregation();
+    TestSQLJoin();
+    TestSQLSubquery();
+    TestSQLCTE();
+    TestSQLWindowFunction();
+
+    std::cout << "\n5. Error Handling:" << std::endl;
+    TestSQLSyntaxError();
+    TestSQLConstraintViolation();
+    TestSQLTableNotFound();
+    TestSQLColumnNotFound();
+
+    std::cout << "\n=== All integration tests PASSED ===" << std::endl;
+    return 0;
+}
