@@ -101,7 +101,7 @@ void TestProtocolConstants() {
     assert(FrontendMessage::Sync == 'S');
     assert(FrontendMessage::Flush == 'H');
     assert(FrontendMessage::Terminate == 'X');
-    assert(FrontendMessage::Password == 'p');
+    assert(FrontendMessage::PasswordMessage == 'p');
 
     // Backend message types
     assert(BackendMessage::Authentication == 'R');
