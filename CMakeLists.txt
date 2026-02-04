@@ -34,19 +34,9 @@ configure_file(
 # Set source directory for subdirectory CMakeLists
 set(DUCKD_SOURCE_DIR ${CMAKE_SOURCE_DIR})
 
-# Build DuckDB from contrib
+# Add all third-party dependencies from contrib
 set(DUCKDB_DIR ${CMAKE_SOURCE_DIR}/contrib/duckdb)
-set(BUILD_SHELL OFF CACHE BOOL "" FORCE)
-set(BUILD_UNITTESTS OFF CACHE BOOL "" FORCE)
-set(ENABLE_EXTENSION_AUTOLOADING ON CACHE BOOL "" FORCE)
-set(ENABLE_EXTENSION_AUTOINSTALL ON CACHE BOOL "" FORCE)
-
-add_subdirectory(${DUCKDB_DIR} ${CMAKE_BINARY_DIR}/duckdb)
-
-# Add asio from contrib
-if(NOT TARGET duckdb_asio)
-    add_subdirectory(${CMAKE_SOURCE_DIR}/contrib/asio ${CMAKE_BINARY_DIR}/asio)
-endif()
+add_subdirectory(contrib)
 
 # DuckDB include directories
 set(DUCKDB_INCLUDE_DIRS
