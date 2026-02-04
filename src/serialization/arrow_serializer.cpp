@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "serialization/arrow_serializer.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 
 namespace duckdb_server {

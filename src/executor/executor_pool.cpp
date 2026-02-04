@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "executor/executor_pool.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 
 namespace duckdb_server {
 

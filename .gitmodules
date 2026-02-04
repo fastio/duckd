@@ -7,3 +7,6 @@
 [submodule "contrib/yaml-cpp"]
 	path = contrib/yaml-cpp
 	url = https://github.com/jbeder/yaml-cpp.git
+[submodule "/Users/jian/Codes/duckd/contrib/spdlog"]
+	path = /Users/jian/Codes/duckd/contrib/spdlog
+	url = https://github.com/gabime/spdlog.git

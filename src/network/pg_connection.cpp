@@ -9,7 +9,7 @@
 #include "network/pg_connection.hpp"
 #include "network/tcp_server.hpp"
 #include "session/session.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 
 namespace duckdb_server {
 

@@ -12,7 +12,7 @@
 #include "session/session_manager.hpp"
 #include "executor/executor_pool.hpp"
 #include "http/http_server.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 #include "version.hpp"
 
 #include <csignal>
@@ -276,7 +276,7 @@ void ReloadConfig() {
 
     // Apply dynamic settings (log level can be changed at runtime)
     if (new_config.log_level != g_config.log_level) {
-        Logger::Instance().SetLevel(new_config.log_level);
+        duckd::Logger::SetLevel(new_config.log_level);
         LOG_INFO("main", "Log level changed to: " + new_config.log_level);
     }
 
@@ -324,10 +324,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Initialize logger
-        Logger::Instance().SetLevel(g_config.log_level);
-        if (!g_config.log_file.empty()) {
-            Logger::Instance().SetOutput(g_config.log_file);
-        }
+        duckd::Logger::Initialize(g_config.log_file, g_config.log_level);
 
         // Write PID file
         if (!g_config.pid_file.empty()) {
@@ -485,6 +482,9 @@ int main(int argc, char* argv[]) {
         RemovePidFile(g_pid_file);
 
         LOG_INFO("main", "DuckD Server stopped");
+
+        // Shutdown logger
+        duckd::Logger::Shutdown();
 
         return 0;
 

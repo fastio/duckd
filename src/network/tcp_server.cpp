@@ -14,7 +14,7 @@
 #include "executor/executor_pool.hpp"
 #include "executor/query_executor.hpp"
 #include "serialization/arrow_serializer.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 
 namespace duckdb_server {
 

@@ -7,9 +7,23 @@
 //===----------------------------------------------------------------------===//
 
 #include "session/session_manager.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
+#include "logging/duckdb_log_storage.hpp"
 
 namespace duckdb_server {
+
+namespace {
+
+// Register DuckDB logging with spdlog
+void SetupDuckDBLogging(duckdb::DatabaseInstance& db) {
+    if (duckd::RegisterSpdlogStorage(db, duckd::Logger::Get())) {
+        LOG_DEBUG("session_manager", "DuckDB logging integrated with spdlog");
+    } else {
+        LOG_WARN("session_manager", "Failed to integrate DuckDB logging with spdlog");
+    }
+}
+
+} // anonymous namespace
 
 SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db,
                                const Config& config)
@@ -28,6 +42,9 @@ SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db,
     pool_config.validate_on_acquire = config.pool_validate_on_acquire;
 
     connection_pool_ = std::make_unique<ConnectionPool>(db_->instance, pool_config);
+
+    // Setup DuckDB logging integration
+    SetupDuckDBLogging(*db_->instance);
 
     // Start cleanup thread
     StartCleanupTimer();
@@ -54,6 +71,9 @@ SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db,
     pool_config.max_connections = max_sessions;
 
     connection_pool_ = std::make_unique<ConnectionPool>(db_->instance, pool_config);
+
+    // Setup DuckDB logging integration
+    SetupDuckDBLogging(*db_->instance);
 
     // Start cleanup thread
     StartCleanupTimer();

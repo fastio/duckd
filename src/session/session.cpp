@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "session/session.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 #include <stdexcept>
 
 namespace duckdb_server {

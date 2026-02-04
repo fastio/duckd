@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "network/io_context_pool.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 
 namespace duckdb_server {
 

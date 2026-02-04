@@ -15,8 +15,15 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/duckdb/CMakeLists.txt")
     message(FATAL_ERROR "Submodules not initialized. Run: git submodule update --init --recursive")
 endif()
 
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spdlog/CMakeLists.txt")
+    message(FATAL_ERROR "Submodules not initialized. Run: git submodule update --init --recursive")
+endif()
+
 # Add dependencies
 # Note: Order matters - dependencies should be added before dependents
+
+# spdlog (fast C++ logging library)
+add_subdirectory(spdlog-cmake)
 
 # ASIO (header-only networking library)
 add_subdirectory(asio-cmake)

@@ -8,7 +8,7 @@
 
 #include "http/http_server.hpp"
 #include "network/tcp_server.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 #include <sstream>
 
 namespace duckdb_server {

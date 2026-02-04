@@ -8,7 +8,7 @@
 
 #include "protocol/pg/pg_handler.hpp"
 #include "session/session.hpp"
-#include "utils/logger.hpp"
+#include "logging/logger.hpp"
 #include <algorithm>
 #include <cctype>
 #include <random>

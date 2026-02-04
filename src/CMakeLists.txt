@@ -34,8 +34,8 @@ set(DUCKD_SERVER_SOURCES
     # HTTP
     ${DUCKD_SRC_DIR}/http/http_server.cpp
 
-    # Utils
-    ${DUCKD_SRC_DIR}/utils/logger.cpp
+    # Logging
+    ${DUCKD_SRC_DIR}/logging/logger.cpp
 )
 
 add_library(duckd_server STATIC ${DUCKD_SERVER_SOURCES})
@@ -51,7 +51,9 @@ target_link_libraries(duckd_server
     PUBLIC
         duckdb_static
         duckdb_asio
+        spdlog::spdlog
         Threads::Threads
+        yaml-cpp::yaml-cpp
 )
 
 target_compile_features(duckd_server PUBLIC cxx_std_17)
