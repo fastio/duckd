@@ -7,7 +7,7 @@ set(ASIO_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../asio")
 
 add_library(duckdb_asio INTERFACE)
 
-target_include_directories(duckdb_asio INTERFACE
+target_include_directories(duckdb_asio SYSTEM INTERFACE
     $<BUILD_INTERFACE:${ASIO_SOURCE_DIR}/asio/include>
 )
 

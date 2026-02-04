@@ -56,7 +56,7 @@ bool PgHandler::ProcessData(const uint8_t* data, size_t len) {
             // Password message: type(1) + length(4) + content
             if (buffer_.size() < 5) return true;
 
-            char type = static_cast<char>(buffer_[0]);
+            // Message type is 'p' for PasswordMessage (not used, just for documentation)
             int32_t msg_len;
             std::memcpy(&msg_len, buffer_.data() + 1, 4);
             msg_len = NetworkToHost32(msg_len);

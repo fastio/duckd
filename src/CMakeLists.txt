@@ -43,7 +43,7 @@ add_library(duckd_server STATIC ${DUCKD_SERVER_SOURCES})
 target_include_directories(duckd_server
     PUBLIC
         ${DUCKD_SRC_DIR}
-    PRIVATE
+    SYSTEM PRIVATE
         ${DUCKDB_INCLUDE_DIRS}
 )
 

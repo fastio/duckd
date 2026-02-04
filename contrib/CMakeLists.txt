@@ -40,4 +40,18 @@ set(ENABLE_EXTENSION_AUTOINSTALL ON CACHE BOOL "" FORCE)
 set(ENABLE_SANITIZER OFF CACHE BOOL "" FORCE)
 set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
 set(ENABLE_THREAD_SANITIZER OFF CACHE BOOL "" FORCE)
+
+# Suppress warnings from third-party code (DuckDB and its dependencies)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    # Save current compile options
+    set(DUCKD_SAVED_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+    # Suppress warnings for third-party code
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
+endif()
+
 add_subdirectory(duckdb)
+
+# Restore compile options after DuckDB
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set(CMAKE_CXX_FLAGS "${DUCKD_SAVED_CXX_FLAGS}")
+endif()
