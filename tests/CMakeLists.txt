@@ -2,7 +2,7 @@
 # tests/CMakeLists.txt
 
 #===----------------------------------------------------------------------===//
-# Unit Tests - PostgreSQL Protocol
+# Unit Tests - Logging
 #===----------------------------------------------------------------------===//
 
 # Common libraries for unit tests
@@ -13,6 +13,23 @@ set(DUCKD_TEST_LIBS
     parquet_extension
     duckdb_generated_extension_loader
 )
+
+# Test: logger (logging system)
+add_executable(test_logger
+    ${CMAKE_SOURCE_DIR}/tests/unit/logging/test_logger.cpp
+)
+target_include_directories(test_logger
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${DUCKDB_INCLUDE_DIRS}
+)
+target_link_libraries(test_logger PRIVATE ${DUCKD_TEST_LIBS})
+target_compile_features(test_logger PUBLIC cxx_std_17)
+add_test(NAME test_logger COMMAND test_logger)
+
+#===----------------------------------------------------------------------===//
+# Unit Tests - PostgreSQL Protocol
+#===----------------------------------------------------------------------===//
 
 # Test: pg_protocol (byte order utilities and constants)
 add_executable(test_pg_protocol
@@ -128,4 +145,14 @@ add_custom_target(test_pg
         test_pg_message_reader
         test_pg_integration
     COMMENT "Running PostgreSQL protocol tests"
+)
+
+#===----------------------------------------------------------------------===//
+# Custom test target: run logging tests
+#===----------------------------------------------------------------------===//
+
+add_custom_target(test_logging
+    COMMAND ${CMAKE_CTEST_COMMAND} -R "test_logger" --output-on-failure
+    DEPENDS test_logger
+    COMMENT "Running logging tests"
 )
