@@ -9,6 +9,7 @@
 #include "network/pg_connection.hpp"
 #include "network/tcp_server.hpp"
 #include "session/session.hpp"
+#include "session/session_manager.hpp"
 #include "logging/logger.hpp"
 
 namespace duckdb_server {
@@ -28,6 +29,7 @@ PgConnection::PgConnection(asio::ip::tcp::socket socket,
 }
 
 PgConnection::~PgConnection() {
+    LOG_DEBUG("pg_conn", "PgConnection destructor called");
     Close();
 }
 
@@ -46,7 +48,29 @@ void PgConnection::Start() {
 
 void PgConnection::Close() {
     if (closed_) return;
+
+    LOG_DEBUG("pg_conn", "Close() called, cleaning up resources");
     closed_ = true;
+
+    // IMPORTANT: Remove session from SessionManager first.
+    // The SessionManager holds a shared_ptr<Session> in its sessions_ map.
+    // Without removing it, the Session and PooledConnection would be kept alive
+    // until the cleanup thread removes expired sessions (default: 30 minutes).
+    if (session_ && server_) {
+        uint64_t session_id = session_->GetSessionId();
+        if (auto session_manager = server_->GetSessionManager()) {
+            session_manager->RemoveSession(session_id);
+            LOG_DEBUG("pg_conn", "Removed session " + std::to_string(session_id) + " from SessionManager");
+        }
+    }
+
+    // Reset handler_ to break circular reference.
+    // The send_callback_ lambda in handler_ captures shared_ptr<PgConnection>,
+    // creating a cycle: PgConnection -> handler_ -> send_callback_ -> self.
+    handler_.reset();
+
+    // Release our session reference
+    session_.reset();
 
     asio::error_code ec;
     socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -84,6 +108,11 @@ void PgConnection::DoRead() {
                     LOG_DEBUG("pg_conn", "Read error: " + ec.message());
                 }
                 Close();
+                return;
+            }
+
+            // Check if connection was closed while async operation was pending
+            if (closed_ || !handler_) {
                 return;
             }
 

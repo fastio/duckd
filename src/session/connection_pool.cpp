@@ -199,8 +199,8 @@ void ConnectionPool::Release(duckdb::Connection* conn) {
     available_.push(std::move(entry));
 
     LOG_DEBUG("conn_pool", "Released connection (available=" +
-             std::to_string(available_.size()) +
-             ", in_use=" + std::to_string(in_use_.size()) + ")");
+              std::to_string(available_.size()) +
+              ", in_use=" + std::to_string(in_use_.size()) + ")");
 
     // Notify waiters
     available_cv_.notify_one();

@@ -37,6 +37,7 @@ Session::Session(uint64_t session_id, duckdb::shared_ptr<duckdb::DatabaseInstanc
 }
 
 Session::~Session() {
+    LOG_DEBUG("session", "Session " + std::to_string(session_id_) + " destructor - returning connection to pool");
     ClearPreparedStatements();
     // PooledConnection will automatically return to pool in its destructor
 }
