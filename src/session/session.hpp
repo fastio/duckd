@@ -11,6 +11,7 @@
 #include "common.hpp"
 #include "session/connection_pool.hpp"
 #include "duckdb.hpp"
+#include <parallel_hashmap/phmap.h>
 
 namespace duckdb_server {
 
@@ -96,7 +97,8 @@ private:
     std::string username_;
 
     // Prepared statements
-    std::unordered_map<std::string, std::unique_ptr<duckdb::PreparedStatement>> prepared_statements_;
+    // Using phmap::flat_hash_map for better performance than std::unordered_map
+    phmap::flat_hash_map<std::string, std::unique_ptr<duckdb::PreparedStatement>> prepared_statements_;
     std::mutex prepared_mutex_;
 
     // Current query tracking

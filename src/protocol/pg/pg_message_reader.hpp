@@ -9,11 +9,11 @@
 #pragma once
 
 #include "protocol/pg/pg_protocol.hpp"
+#include <parallel_hashmap/phmap.h>
 #include <vector>
 #include <string>
 #include <cstring>
 #include <optional>
-#include <unordered_map>
 
 namespace duckdb_server {
 namespace pg {
@@ -23,7 +23,7 @@ namespace pg {
 //===----------------------------------------------------------------------===//
 struct StartupMessage {
     int32_t protocol_version;
-    std::unordered_map<std::string, std::string> parameters;
+    phmap::flat_hash_map<std::string, std::string> parameters;
 
     std::string GetParameter(const std::string& key, const std::string& default_val = "") const {
         auto it = parameters.find(key);

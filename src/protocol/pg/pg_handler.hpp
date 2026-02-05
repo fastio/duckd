@@ -13,9 +13,9 @@
 #include "protocol/pg/pg_message_reader.hpp"
 #include "protocol/pg/pg_message_writer.hpp"
 #include "duckdb.hpp"
+#include <parallel_hashmap/phmap.h>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <functional>
 
 namespace duckdb_server {
@@ -125,8 +125,9 @@ private:
     int32_t secret_key_;
 
     // Prepared statements and portals
-    std::unordered_map<std::string, PreparedStatementInfo> prepared_statements_;
-    std::unordered_map<std::string, PortalInfo> portals_;
+    // Using phmap::flat_hash_map for better performance than std::unordered_map
+    phmap::flat_hash_map<std::string, PreparedStatementInfo> prepared_statements_;
+    phmap::flat_hash_map<std::string, PortalInfo> portals_;
 
     // Buffer for incomplete messages
     std::vector<uint8_t> buffer_;
