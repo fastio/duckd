@@ -1,0 +1,58 @@
+# DuckD Server Configuration
+# Copy to /etc/duckd/config.yaml or use -c/--config to specify path
+
+# Server settings
+server:
+  host: "0.0.0.0"
+  port: 5432
+  http_port: 8080    # Health/metrics endpoint, 0 to disable
+  protocol: postgresql  # postgresql or native
+
+# Database settings
+database:
+  path: "/var/lib/duckd/data.duckdb"
+  # path: ":memory:"  # In-memory database
+
+# Logging configuration
+logging:
+  level: info        # debug, info, warn, error
+  file: "/var/log/duckd/duckd.log"
+
+# Process management
+process:
+  daemon: false
+  pid_file: "/var/run/duckd/duckd.pid"
+  # user: duckd      # User to run as (requires starting as root)
+
+# Thread pool configuration
+threads:
+  io: 0              # 0 = auto (CPU cores / 2)
+  executor: 0        # 0 = auto (CPU cores)
+
+# Resource limits
+limits:
+  max_connections: 100
+  max_memory: 0              # bytes, 0 = unlimited
+  max_open_files: 0          # 0 = system default
+  query_timeout_ms: 300000   # 5 minutes
+  session_timeout_minutes: 30
+
+# Connection pool settings
+pool:
+  min: 5
+  max: 50
+  idle_timeout_seconds: 300
+  acquire_timeout_ms: 5000
+  validate_on_acquire: true
+
+# Future: SSL/TLS configuration (not yet implemented)
+# security:
+#   ssl:
+#     enabled: false
+#     cert_file: "/etc/duckd/server.crt"
+#     key_file: "/etc/duckd/server.key"
+#     ca_file: "/etc/duckd/ca.crt"
+#
+#   auth:
+#     method: trust    # trust, password, ldap
+#     password_file: "/etc/duckd/users.yaml"

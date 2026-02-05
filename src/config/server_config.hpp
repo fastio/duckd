@@ -9,10 +9,12 @@
 #pragma once
 
 #include "config/config_file.hpp"
+#include "config/yaml_config.hpp"
 #include <string>
 #include <thread>
 #include <iostream>
 #include <cstdlib>
+#include <algorithm>
 
 namespace duckdb_server {
 
@@ -86,8 +88,25 @@ struct ServerConfig {
         return true;
     }
 
-    // Load from config file (values can be overridden by command line)
+    // Load from config file (auto-detects format by extension)
     bool LoadFromFile(const std::string& path, std::string& error) {
+        // Detect file format by extension
+        std::string ext;
+        auto dot_pos = path.rfind('.');
+        if (dot_pos != std::string::npos) {
+            ext = path.substr(dot_pos);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        }
+
+        if (ext == ".yaml" || ext == ".yml") {
+            return LoadFromYaml(path, error);
+        } else {
+            return LoadFromIni(path, error);
+        }
+    }
+
+    // Load from INI-style config file (legacy format)
+    bool LoadFromIni(const std::string& path, std::string& error) {
         ConfigFile cfg;
         if (!cfg.Load(path)) {
             error = cfg.GetError();
@@ -123,6 +142,60 @@ struct ServerConfig {
                 protocol = ProtocolType::Native;
             }
         }
+
+        return true;
+    }
+
+    // Load from YAML config file
+    bool LoadFromYaml(const std::string& path, std::string& error) {
+        YamlConfig cfg;
+        if (!cfg.Load(path)) {
+            error = cfg.GetError();
+            return false;
+        }
+
+        // Server section
+        if (cfg.Has("server.host")) host = cfg.GetString("server.host");
+        if (cfg.Has("server.port")) port = static_cast<uint16_t>(cfg.GetInt("server.port"));
+        if (cfg.Has("server.http_port")) http_port = static_cast<uint16_t>(cfg.GetInt("server.http_port"));
+        if (cfg.Has("server.protocol")) {
+            std::string proto = cfg.GetString("server.protocol");
+            if (proto == "postgresql" || proto == "pg") {
+                protocol = ProtocolType::PostgreSQL;
+            } else if (proto == "native") {
+                protocol = ProtocolType::Native;
+            }
+        }
+
+        // Database section
+        if (cfg.Has("database.path")) database_path = cfg.GetString("database.path");
+
+        // Logging section
+        if (cfg.Has("logging.file")) log_file = cfg.GetString("logging.file");
+        if (cfg.Has("logging.level")) log_level = cfg.GetString("logging.level");
+
+        // Process section
+        if (cfg.Has("process.daemon")) daemon = cfg.GetBool("process.daemon");
+        if (cfg.Has("process.pid_file")) pid_file = cfg.GetString("process.pid_file");
+        if (cfg.Has("process.user")) user = cfg.GetString("process.user");
+
+        // Threads section
+        if (cfg.Has("threads.io")) io_threads = static_cast<uint32_t>(cfg.GetInt("threads.io"));
+        if (cfg.Has("threads.executor")) executor_threads = static_cast<uint32_t>(cfg.GetInt("threads.executor"));
+
+        // Limits section
+        if (cfg.Has("limits.max_connections")) max_connections = static_cast<uint32_t>(cfg.GetInt("limits.max_connections"));
+        if (cfg.Has("limits.max_memory")) max_memory = static_cast<uint64_t>(cfg.GetInt64("limits.max_memory"));
+        if (cfg.Has("limits.max_open_files")) max_open_files = static_cast<uint32_t>(cfg.GetInt("limits.max_open_files"));
+        if (cfg.Has("limits.query_timeout_ms")) query_timeout_ms = static_cast<uint32_t>(cfg.GetInt("limits.query_timeout_ms"));
+        if (cfg.Has("limits.session_timeout_minutes")) session_timeout_minutes = static_cast<uint32_t>(cfg.GetInt("limits.session_timeout_minutes"));
+
+        // Pool section
+        if (cfg.Has("pool.min")) pool_min_connections = static_cast<uint32_t>(cfg.GetInt("pool.min"));
+        if (cfg.Has("pool.max")) pool_max_connections = static_cast<uint32_t>(cfg.GetInt("pool.max"));
+        if (cfg.Has("pool.idle_timeout_seconds")) pool_idle_timeout_seconds = static_cast<uint32_t>(cfg.GetInt("pool.idle_timeout_seconds"));
+        if (cfg.Has("pool.acquire_timeout_ms")) pool_acquire_timeout_ms = static_cast<uint32_t>(cfg.GetInt("pool.acquire_timeout_ms"));
+        if (cfg.Has("pool.validate_on_acquire")) pool_validate_on_acquire = cfg.GetBool("pool.validate_on_acquire");
 
         return true;
     }
