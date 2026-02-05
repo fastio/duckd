@@ -12,6 +12,7 @@
 #include "session/session.hpp"
 #include "session/connection_pool.hpp"
 #include "duckdb.hpp"
+#include <parallel_hashmap/phmap.h>
 
 namespace duckdb_server {
 
@@ -93,9 +94,17 @@ private:
     // Connection pool
     std::unique_ptr<ConnectionPool> connection_pool_;
 
-    // Sessions
-    std::unordered_map<uint64_t, SessionPtr> sessions_;
-    mutable std::mutex sessions_mutex_;
+    // Sessions - using parallel_flat_hash_map for high-concurrency access
+    // The parallel version internally shards the map and uses fine-grained locking
+    phmap::parallel_flat_hash_map<
+        uint64_t,
+        SessionPtr,
+        phmap::priv::hash_default_hash<uint64_t>,
+        phmap::priv::hash_default_eq<uint64_t>,
+        phmap::priv::Allocator<phmap::priv::Pair<const uint64_t, SessionPtr>>,
+        4,  // N=4 means 2^4=16 submaps for parallel access
+        std::mutex
+    > sessions_;
 
     // Configuration
     Config config_;

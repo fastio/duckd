@@ -54,6 +54,7 @@ target_link_libraries(duckd_server
         spdlog::spdlog
         Threads::Threads
         yaml-cpp::yaml-cpp
+        phmap::phmap
 )
 
 target_compile_features(duckd_server PUBLIC cxx_std_17)

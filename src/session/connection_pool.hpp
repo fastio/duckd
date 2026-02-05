@@ -10,6 +10,7 @@
 
 #include "common.hpp"
 #include "duckdb.hpp"
+#include <parallel_hashmap/phmap.h>
 #include <queue>
 #include <condition_variable>
 #include <atomic>
@@ -146,7 +147,9 @@ private:
 
     // Pool state
     std::queue<std::unique_ptr<PoolEntry>> available_;
-    std::unordered_map<duckdb::Connection*, std::unique_ptr<PoolEntry>> in_use_;
+    // Using phmap::flat_hash_map for better performance than std::unordered_map
+    // (SwissTable-based implementation from Google Abseil)
+    phmap::flat_hash_map<duckdb::Connection*, std::unique_ptr<PoolEntry>> in_use_;
     mutable std::mutex mutex_;
     std::condition_variable available_cv_;
 

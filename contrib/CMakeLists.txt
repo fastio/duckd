@@ -19,6 +19,10 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/spdlog/CMakeLists.txt")
     message(FATAL_ERROR "Submodules not initialized. Run: git submodule update --init --recursive")
 endif()
 
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/parallel-hashmap/parallel_hashmap")
+    message(FATAL_ERROR "Submodules not initialized. Run: git submodule update --init --recursive")
+endif()
+
 # Add dependencies
 # Note: Order matters - dependencies should be added before dependents
 
@@ -30,6 +34,9 @@ add_subdirectory(asio-cmake)
 
 # yaml-cpp (YAML parser)
 add_subdirectory(yaml-cpp-cmake)
+
+# parallel-hashmap (high-performance concurrent hash map)
+add_subdirectory(parallel-hashmap-cmake)
 
 # DuckDB (analytical database)
 set(BUILD_SHELL OFF CACHE BOOL "" FORCE)

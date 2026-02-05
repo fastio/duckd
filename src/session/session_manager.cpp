@@ -89,19 +89,14 @@ SessionManager::~SessionManager() {
     }
 
     // Clear all sessions (will return connections to pool)
-    {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-        sessions_.clear();
-    }
+    sessions_.clear();
 
     // Connection pool will be destroyed after sessions
     LOG_INFO("session_manager", "Session manager shutdown");
 }
 
 SessionPtr SessionManager::CreateSession() {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-
-    // Check max sessions
+    // Check max sessions (approximate check for performance)
     if (sessions_.size() >= config_.max_sessions) {
         LOG_WARN("session_manager", "Maximum sessions reached: " +
                  std::to_string(config_.max_sessions));
@@ -121,8 +116,8 @@ SessionPtr SessionManager::CreateSession() {
     // Create session with pooled connection
     auto session = std::make_shared<Session>(session_id, std::move(pooled_conn));
 
-    // Store
-    sessions_[session_id] = session;
+    // Store using thread-safe insertion
+    sessions_.insert({session_id, session});
     total_sessions_created_++;
 
     LOG_DEBUG("session_manager", "Created session " + std::to_string(session_id) +
@@ -132,22 +127,20 @@ SessionPtr SessionManager::CreateSession() {
 }
 
 SessionPtr SessionManager::GetSession(uint64_t session_id) {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    SessionPtr result = nullptr;
 
-    auto it = sessions_.find(session_id);
-    if (it != sessions_.end()) {
-        return it->second;
-    }
+    // Thread-safe lookup using if_contains
+    sessions_.if_contains(session_id, [&result](const auto& item) {
+        result = item.second;
+    });
 
-    return nullptr;
+    return result;
 }
 
 bool SessionManager::RemoveSession(uint64_t session_id) {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
+    size_t erased = sessions_.erase(session_id);
 
-    auto it = sessions_.find(session_id);
-    if (it != sessions_.end()) {
-        sessions_.erase(it);
+    if (erased > 0) {
         LOG_DEBUG("session_manager", "Removed session " + std::to_string(session_id) +
                   " (total: " + std::to_string(sessions_.size()) + ")");
         return true;
@@ -159,18 +152,17 @@ bool SessionManager::RemoveSession(uint64_t session_id) {
 size_t SessionManager::CleanupExpiredSessions() {
     std::vector<uint64_t> expired;
 
-    {
-        std::lock_guard<std::mutex> lock(sessions_mutex_);
-
-        for (const auto& [id, session] : sessions_) {
-            if (session->IsExpired(config_.session_timeout)) {
-                expired.push_back(id);
-            }
+    // First pass: collect expired session IDs
+    // Using for_each for thread-safe iteration
+    sessions_.for_each([this, &expired](const auto& item) {
+        if (item.second->IsExpired(config_.session_timeout)) {
+            expired.push_back(item.first);
         }
+    });
 
-        for (uint64_t id : expired) {
-            sessions_.erase(id);
-        }
+    // Second pass: remove expired sessions
+    for (uint64_t id : expired) {
+        sessions_.erase(id);
     }
 
     if (!expired.empty()) {
@@ -182,7 +174,6 @@ size_t SessionManager::CleanupExpiredSessions() {
 }
 
 size_t SessionManager::GetActiveSessionCount() const {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
     return sessions_.size();
 }
 

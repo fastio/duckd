@@ -10,3 +10,6 @@
 [submodule "/Users/jian/Codes/duckd/contrib/spdlog"]
 	path = /Users/jian/Codes/duckd/contrib/spdlog
 	url = https://github.com/gabime/spdlog.git
+[submodule "/Users/jian/Codes/duckd/contrib/parallel-hashmap"]
+	path = /Users/jian/Codes/duckd/contrib/parallel-hashmap
+	url = https://github.com/greg7mdp/parallel-hashmap.git
