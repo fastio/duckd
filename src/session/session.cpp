@@ -12,12 +12,12 @@
 
 namespace duckdb_server {
 
-// Constructor with pooled connection
-Session::Session(uint64_t session_id, PooledConnection connection)
+// Constructor with connection pool (lazy acquisition)
+Session::Session(uint64_t session_id, ConnectionPool* pool)
     : session_id_(session_id)
     , created_at_(Clock::now())
     , last_active_(Clock::now())
-    , pooled_connection_(std::move(connection))
+    , pool_(pool)
     , current_database_("main")
     , current_schema_("main")
     , current_query_id_(0)
@@ -43,17 +43,36 @@ Session::~Session() {
 }
 
 duckdb::Connection& Session::GetConnection() {
-    if (pooled_connection_) {
-        return *pooled_connection_;
+    // Lazy acquisition: acquire from pool on first use
+    if (active_connection_) {
+        return *active_connection_;
     }
     if (owned_connection_) {
         return *owned_connection_;
     }
+    if (pool_) {
+        active_connection_ = pool_->Acquire();
+        if (active_connection_) {
+            return *active_connection_;
+        }
+        throw std::runtime_error("Failed to acquire connection from pool");
+    }
     throw std::runtime_error("Session has no valid connection");
 }
 
+void Session::ReleaseConnection() {
+    if (active_connection_) {
+        LOG_DEBUG("session", "Session " + std::to_string(session_id_) + " releasing connection back to pool");
+        active_connection_.Release();
+    }
+}
+
+bool Session::HasActiveConnection() const {
+    return static_cast<bool>(active_connection_) || static_cast<bool>(owned_connection_);
+}
+
 bool Session::HasConnection() const {
-    return static_cast<bool>(pooled_connection_) || static_cast<bool>(owned_connection_);
+    return static_cast<bool>(active_connection_) || static_cast<bool>(owned_connection_) || (pool_ != nullptr);
 }
 
 void Session::AddPreparedStatement(const std::string& name,

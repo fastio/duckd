@@ -19,6 +19,7 @@ namespace duckdb_server {
 
 class TcpServer;
 class Session;
+class ExecutorPool;
 
 class PgConnection : public std::enable_shared_from_this<PgConnection> {
 public:
@@ -26,7 +27,8 @@ public:
 
     static Ptr Create(asio::ip::tcp::socket socket,
                       TcpServer* server,
-                      std::shared_ptr<Session> session);
+                      std::shared_ptr<Session> session,
+                      std::shared_ptr<ExecutorPool> executor_pool);
 
     ~PgConnection();
 
@@ -43,16 +45,21 @@ public:
 private:
     PgConnection(asio::ip::tcp::socket socket,
                  TcpServer* server,
-                 std::shared_ptr<Session> session);
+                 std::shared_ptr<Session> session,
+                 std::shared_ptr<ExecutorPool> executor_pool);
 
     void DoRead();
     void DoWrite();
     void Send(const std::vector<uint8_t>& data);
 
+    // Resume message processing after async operation completes
+    void ResumeAfterAsync();
+
 private:
     asio::ip::tcp::socket socket_;
     TcpServer* server_;
     std::shared_ptr<Session> session_;
+    std::shared_ptr<ExecutorPool> executor_pool_;
     std::unique_ptr<pg::PgHandler> handler_;
 
     std::array<uint8_t, 8192> read_buffer_;

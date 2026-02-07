@@ -19,8 +19,8 @@ class Session {
 public:
     using Ptr = std::shared_ptr<Session>;
 
-    // Constructor with pooled connection
-    Session(uint64_t session_id, PooledConnection connection);
+    // Constructor with connection pool (lazy acquisition)
+    Session(uint64_t session_id, ConnectionPool* pool);
 
     // Legacy constructor (creates own connection, for backward compatibility)
     Session(uint64_t session_id,
@@ -37,10 +37,16 @@ public:
     TimePoint GetCreatedAt() const { return created_at_; }
     TimePoint GetLastActive() const { return last_active_; }
 
-    // Get the underlying connection
+    // Get the underlying connection (acquires from pool on demand)
     duckdb::Connection& GetConnection();
 
-    // Check if session has a valid connection
+    // Release connection back to pool (only if not in transaction)
+    void ReleaseConnection();
+
+    // Check if session currently holds an active connection
+    bool HasActiveConnection() const;
+
+    // Check if session has any valid connection source
     bool HasConnection() const;
 
     // State
@@ -86,8 +92,11 @@ private:
     TimePoint created_at_;
     TimePoint last_active_;
 
-    // DuckDB connection - either pooled or owned
-    PooledConnection pooled_connection_;
+    // Connection pool (for lazy acquisition)
+    ConnectionPool* pool_ = nullptr;
+
+    // DuckDB connection - lazily acquired from pool or owned
+    PooledConnection active_connection_;
     std::unique_ptr<duckdb::Connection> owned_connection_;  // Legacy fallback
 
     // Session state

@@ -10,22 +10,26 @@
 #include "network/tcp_server.hpp"
 #include "session/session.hpp"
 #include "session/session_manager.hpp"
+#include "executor/executor_pool.hpp"
 #include "logging/logger.hpp"
 
 namespace duckdb_server {
 
 PgConnection::Ptr PgConnection::Create(asio::ip::tcp::socket socket,
                                         TcpServer* server,
-                                        std::shared_ptr<Session> session) {
-    return Ptr(new PgConnection(std::move(socket), server, std::move(session)));
+                                        std::shared_ptr<Session> session,
+                                        std::shared_ptr<ExecutorPool> executor_pool) {
+    return Ptr(new PgConnection(std::move(socket), server, std::move(session), std::move(executor_pool)));
 }
 
 PgConnection::PgConnection(asio::ip::tcp::socket socket,
                            TcpServer* server,
-                           std::shared_ptr<Session> session)
+                           std::shared_ptr<Session> session,
+                           std::shared_ptr<ExecutorPool> executor_pool)
     : socket_(std::move(socket))
     , server_(server)
-    , session_(std::move(session)) {
+    , session_(std::move(session))
+    , executor_pool_(std::move(executor_pool)) {
 }
 
 PgConnection::~PgConnection() {
@@ -36,10 +40,23 @@ PgConnection::~PgConnection() {
 void PgConnection::Start() {
     auto self = shared_from_this();
 
-    // Create the PG handler with send callback
-    handler_ = std::make_unique<pg::PgHandler>(session_, [this, self](const std::vector<uint8_t>& data) {
-        Send(data);
-    });
+    // Create resume callback that posts back to the IO thread
+    auto resume_callback = [this, self]() {
+        asio::post(socket_.get_executor(), [this, self]() {
+            if (closed_ || !handler_) return;
+            ResumeAfterAsync();
+        });
+    };
+
+    // Create the PG handler with send callback, executor pool, and resume callback
+    handler_ = std::make_unique<pg::PgHandler>(
+        session_,
+        [this, self](const std::vector<uint8_t>& data) {
+            Send(data);
+        },
+        executor_pool_,
+        std::move(resume_callback)
+    );
 
     LOG_INFO("pg_conn", "New PostgreSQL connection from " + GetRemoteAddress() + ":" + std::to_string(GetRemotePort()));
 
@@ -71,6 +88,9 @@ void PgConnection::Close() {
 
     // Release our session reference
     session_.reset();
+
+    // Release executor pool reference
+    executor_pool_.reset();
 
     asio::error_code ec;
     socket_.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
@@ -121,15 +141,38 @@ void PgConnection::DoRead() {
             }
 
             // Process data through PG handler
-            bool should_continue = handler_->ProcessData(read_buffer_.data(), bytes_read);
+            auto result = handler_->ProcessData(read_buffer_.data(), bytes_read);
 
-            if (!should_continue || handler_->GetState() == pg::PgConnectionState::Closed) {
-                Close();
-                return;
+            switch (result) {
+                case pg::ProcessResult::Continue:
+                    DoRead();
+                    break;
+                case pg::ProcessResult::AsyncPending:
+                    // Don't call DoRead() — wait for ResumeAfterAsync
+                    break;
+                case pg::ProcessResult::Close:
+                    Close();
+                    break;
             }
-
-            DoRead();
         });
+}
+
+void PgConnection::ResumeAfterAsync() {
+    if (closed_ || !handler_) return;
+
+    auto result = handler_->ProcessPendingBuffer();
+
+    switch (result) {
+        case pg::ProcessResult::Continue:
+            DoRead();
+            break;
+        case pg::ProcessResult::AsyncPending:
+            // Another async op was triggered, wait again
+            break;
+        case pg::ProcessResult::Close:
+            Close();
+            break;
+    }
 }
 
 void PgConnection::Send(const std::vector<uint8_t>& data) {
@@ -147,7 +190,11 @@ void PgConnection::Send(const std::vector<uint8_t>& data) {
     }
 
     if (should_write) {
-        DoWrite();
+        // Ensure DoWrite runs on the IO thread (may be called from executor thread)
+        auto self = shared_from_this();
+        asio::post(socket_.get_executor(), [this, self]() {
+            DoWrite();
+        });
     }
 }
 

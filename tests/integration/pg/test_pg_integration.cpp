@@ -10,11 +10,15 @@
 #include "protocol/pg/pg_protocol.hpp"
 #include "protocol/pg/pg_message_reader.hpp"
 #include "session/session.hpp"
+#include "executor/executor_pool.hpp"
 #include "duckdb.hpp"
 #include <cassert>
 #include <iostream>
 #include <cstring>
 #include <functional>
+#include <atomic>
+#include <chrono>
+#include <thread>
 
 using namespace duckdb_server;
 using namespace duckdb_server::pg;
@@ -29,18 +33,64 @@ public:
         // Create in-memory DuckDB database
         db_ = std::make_unique<duckdb::DuckDB>(nullptr);
 
+        // Create executor pool for async operations
+        executor_pool_ = std::make_shared<ExecutorPool>(2);
+        executor_pool_->Start();
+
         // Create session with session_id and db instance
         session_ = std::make_shared<Session>(1, db_->instance);
 
-        // Create handler with send callback
-        handler_ = std::make_unique<PgHandler>(session_,
+        // Create handler with send callback, executor pool, and resume callback
+        handler_ = std::make_unique<PgHandler>(
+            session_,
             [this](const std::vector<uint8_t>& data) {
                 received_data_.insert(received_data_.end(), data.begin(), data.end());
-            });
+            },
+            executor_pool_,
+            [this]() {
+                async_complete_.store(true);
+            }
+        );
+    }
+
+    ~PgProtocolTest() {
+        handler_.reset();
+        if (executor_pool_) {
+            executor_pool_->Stop();
+        }
     }
 
     void ClearReceived() {
         received_data_.clear();
+    }
+
+    // Wait for async operation to complete
+    void WaitForAsync() {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!async_complete_.load()) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                std::cerr << "TIMEOUT waiting for async operation" << std::endl;
+                assert(false && "Async operation timed out");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        async_complete_.store(false);
+    }
+
+    // Process data and handle async results; returns true if connection should continue
+    bool ProcessAndWait(const std::vector<uint8_t>& buf) {
+        auto result = handler_->ProcessData(buf.data(), buf.size());
+        if (result == ProcessResult::AsyncPending) {
+            WaitForAsync();
+            // Process any remaining buffer
+            auto pending_result = handler_->ProcessPendingBuffer();
+            if (pending_result == ProcessResult::AsyncPending) {
+                WaitForAsync();
+                pending_result = handler_->ProcessPendingBuffer();
+            }
+            return pending_result != ProcessResult::Close;
+        }
+        return result != ProcessResult::Close;
     }
 
     // Send startup message
@@ -66,7 +116,7 @@ public:
         int32_t network_length = HostToNetwork32(length);
         std::memcpy(buf.data() + length_pos, &network_length, 4);
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send simple query
@@ -81,7 +131,7 @@ public:
         // Query string
         WriteString(buf, sql);
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Parse message
@@ -104,7 +154,7 @@ public:
         WriteInt32(buf, length);
         buf.insert(buf.end(), body.begin(), body.end());
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Bind message
@@ -134,7 +184,7 @@ public:
         WriteInt32(buf, length);
         buf.insert(buf.end(), body.begin(), body.end());
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Describe message
@@ -150,7 +200,7 @@ public:
         WriteInt32(buf, length);
         buf.insert(buf.end(), body.begin(), body.end());
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Execute message
@@ -166,13 +216,13 @@ public:
         WriteInt32(buf, length);
         buf.insert(buf.end(), body.begin(), body.end());
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Sync message
     bool SendSync() {
         std::vector<uint8_t> buf = {'S', 0, 0, 0, 4};
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Close message
@@ -188,13 +238,13 @@ public:
         WriteInt32(buf, length);
         buf.insert(buf.end(), body.begin(), body.end());
 
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Send Terminate
     bool SendTerminate() {
         std::vector<uint8_t> buf = {'X', 0, 0, 0, 4};
-        return handler_->ProcessData(buf.data(), buf.size());
+        return ProcessAndWait(buf);
     }
 
     // Check if received data contains message type
@@ -291,9 +341,11 @@ private:
     }
 
     std::unique_ptr<duckdb::DuckDB> db_;
+    std::shared_ptr<ExecutorPool> executor_pool_;
     std::shared_ptr<Session> session_;
     std::unique_ptr<PgHandler> handler_;
     std::vector<uint8_t> received_data_;
+    std::atomic<bool> async_complete_{false};
 };
 
 //===----------------------------------------------------------------------===//

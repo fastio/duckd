@@ -103,18 +103,11 @@ SessionPtr SessionManager::CreateSession() {
         return nullptr;
     }
 
-    // Acquire connection from pool
-    auto pooled_conn = connection_pool_->Acquire();
-    if (!pooled_conn) {
-        LOG_WARN("session_manager", "Failed to acquire connection from pool");
-        return nullptr;
-    }
-
     // Generate session ID
     uint64_t session_id = NextSessionId();
 
-    // Create session with pooled connection
-    auto session = std::make_shared<Session>(session_id, std::move(pooled_conn));
+    // Create session with pool pointer (lazy connection acquisition)
+    auto session = std::make_shared<Session>(session_id, connection_pool_.get());
 
     // Store using thread-safe insertion
     sessions_.insert({session_id, session});

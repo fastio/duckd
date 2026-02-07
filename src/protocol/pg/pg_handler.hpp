@@ -21,8 +21,18 @@
 namespace duckdb_server {
 
 class Session;
+class ExecutorPool;
 
 namespace pg {
+
+//===----------------------------------------------------------------------===//
+// Process Result - controls message loop and read scheduling
+//===----------------------------------------------------------------------===//
+enum class ProcessResult {
+    Continue,      // Continue reading from socket
+    AsyncPending,  // Async operation in flight, stop reading until resume
+    Close          // Close the connection
+};
 
 //===----------------------------------------------------------------------===//
 // Prepared Statement Info
@@ -65,12 +75,17 @@ enum class PgConnectionState {
 class PgHandler {
 public:
     using SendCallback = std::function<void(const std::vector<uint8_t>&)>;
+    using ResumeCallback = std::function<void()>;
 
-    PgHandler(std::shared_ptr<Session> session, SendCallback send_callback);
+    PgHandler(std::shared_ptr<Session> session, SendCallback send_callback,
+              std::shared_ptr<ExecutorPool> executor_pool, ResumeCallback resume_callback);
     ~PgHandler();
 
-    // Process incoming data, returns true if connection should continue
-    bool ProcessData(const uint8_t* data, size_t len);
+    // Process incoming data
+    ProcessResult ProcessData(const uint8_t* data, size_t len);
+
+    // Process remaining buffered messages after async completion
+    ProcessResult ProcessPendingBuffer();
 
     // Get current state
     PgConnectionState GetState() const { return state_; }
@@ -78,7 +93,13 @@ public:
     // Check if in transaction
     bool InTransaction() const { return in_transaction_; }
 
+    // Check if connection can be released (Step 2: lazy connection)
+    bool CanReleaseConnection() const;
+
 private:
+    // Internal buffer processing loop (shared by ProcessData and ProcessPendingBuffer)
+    ProcessResult ProcessBufferLoop();
+
     // State handlers
     bool HandleStartup(const uint8_t* data, size_t len);
     bool HandleAuthentication(const uint8_t* data, size_t len);
@@ -95,9 +116,11 @@ private:
     void HandleFlush(const uint8_t* data, size_t len);
     void HandleTerminate(const uint8_t* data, size_t len);
 
-    // Query execution
-    void ExecuteQuery(const std::string& sql);
-    void SendQueryResult(duckdb::QueryResult& result, const std::string& command);
+    // Query execution helpers (used in async lambdas with local writer)
+    static void WriteQueryResult(PgMessageWriter& writer, duckdb::QueryResult& result,
+                                 const std::string& command, const std::string& sql,
+                                 uint64_t& rows_affected);
+    static std::string GetCommandTag(const std::string& sql, uint64_t rows_affected);
 
     // Response helpers
     void SendStartupResponse();
@@ -105,18 +128,26 @@ private:
                    const std::string& message, const std::string& detail = "");
     void SendReadyForQuery();
 
+    // Transaction state helpers
+    void UpdateTransactionState(const std::string& sql);
+
     // Utility
-    std::string GetCommandTag(const std::string& sql, uint64_t rows_affected);
     char GetTransactionStatus() const;
+
+    // Revalidate prepared statements after connection switch (Step 2)
+    void RevalidatePreparedStatements(duckdb::Connection& conn);
 
 private:
     std::shared_ptr<Session> session_;
     SendCallback send_callback_;
-    PgMessageWriter writer_;
+    std::shared_ptr<ExecutorPool> executor_pool_;
+    ResumeCallback resume_callback_;
+    PgMessageWriter writer_;  // Only used for synchronous operations on IO thread
 
     PgConnectionState state_ = PgConnectionState::Initial;
     bool in_transaction_ = false;
     bool transaction_failed_ = false;
+    bool async_pending_ = false;
 
     // Connection info
     std::string username_;
@@ -128,6 +159,9 @@ private:
     // Using phmap::flat_hash_map for better performance than std::unordered_map
     phmap::flat_hash_map<std::string, PreparedStatementInfo> prepared_statements_;
     phmap::flat_hash_map<std::string, PortalInfo> portals_;
+
+    // Track last connection pointer for revalidation (Step 2)
+    duckdb::Connection* last_connection_ = nullptr;
 
     // Buffer for incomplete messages
     std::vector<uint8_t> buffer_;

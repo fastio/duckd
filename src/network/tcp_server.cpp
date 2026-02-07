@@ -144,10 +144,13 @@ void TcpServer::DoAccept() {
                     LOG_WARN("server", "Max connections reached, rejecting new connection");
                     socket->close();
                 } else {
+                    // Set TCP_NODELAY for lower latency
+                    socket->set_option(asio::ip::tcp::no_delay(true));
+
                     // Create session for this connection
                     auto session = session_manager_->CreateSession();
                     if (session) {
-                        auto pg_conn = PgConnection::Create(std::move(*socket), this, session);
+                        auto pg_conn = PgConnection::Create(std::move(*socket), this, session, executor_pool_);
                         total_connections_++;
                         pg_conn->Start();
                     } else {
@@ -187,6 +190,9 @@ void TcpServer::DoAccept() {
                     LOG_WARN("server", "Max connections reached, rejecting new connection");
                     conn->Close();
                 } else {
+                    // Set TCP_NODELAY for lower latency
+                    conn->GetSocket().set_option(asio::ip::tcp::no_delay(true));
+
                     AddConnection(conn);
                     conn->Start();
                 }
