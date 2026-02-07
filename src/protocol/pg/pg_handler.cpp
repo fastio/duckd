@@ -12,6 +12,7 @@
 #include "logging/logger.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <random>
 #include <unistd.h>
 
@@ -127,27 +128,35 @@ bool PgHandler::CanReleaseConnection() const {
     return !in_transaction_ && prepared_statements_.empty();
 }
 
-// Extract uppercase prefix of SQL (skipping leading whitespace, up to max_len chars)
-static std::string GetUpperPrefix(const std::string& sql, size_t max_len = 20) {
-    size_t start = 0;
-    while (start < sql.size() && std::isspace(static_cast<unsigned char>(sql[start]))) start++;
-    std::string prefix;
-    size_t end = std::min(sql.size(), start + max_len);
-    prefix.reserve(end - start);
-    for (size_t i = start; i < end; i++) {
-        prefix += static_cast<char>(std::toupper(static_cast<unsigned char>(sql[i])));
+// Zero-allocation case-insensitive prefix match (skips leading whitespace)
+static bool SqlStartsWithCI(const char* sql, size_t len, const char* keyword) {
+    size_t i = 0;
+    while (i < len && (sql[i] == ' ' || sql[i] == '\t' || sql[i] == '\n' || sql[i] == '\r')) i++;
+    size_t klen = strlen(keyword);
+    if (len - i < klen) return false;
+    return strncasecmp(sql + i, keyword, klen) == 0;
+}
+
+// Search for keyword within the first max_scan non-whitespace chars after position start
+static bool SqlContainsCI(const char* sql, size_t len, size_t start, const char* keyword, size_t max_scan) {
+    size_t klen = strlen(keyword);
+    size_t end = std::min(len, start + max_scan);
+    if (klen == 0 || end < klen) return false;
+    for (size_t i = start; i + klen <= end; i++) {
+        if (strncasecmp(sql + i, keyword, klen) == 0) return true;
     }
-    return prefix;
+    return false;
 }
 
 void PgHandler::UpdateTransactionState(const std::string& sql) {
-    auto prefix = GetUpperPrefix(sql, 10);
+    const char* s = sql.data();
+    size_t len = sql.size();
 
-    if (prefix.find("BEGIN") != std::string::npos) {
+    if (SqlStartsWithCI(s, len, "BEGIN")) {
         in_transaction_ = true;
         transaction_failed_ = false;
-    } else if (prefix.find("COMMIT") != std::string::npos ||
-               prefix.find("ROLLBACK") != std::string::npos) {
+    } else if (SqlStartsWithCI(s, len, "COMMIT") ||
+               SqlStartsWithCI(s, len, "ROLLBACK")) {
         in_transaction_ = false;
         transaction_failed_ = false;
     }
@@ -304,7 +313,7 @@ void PgHandler::HandleQuery(const uint8_t* data, size_t len) {
     LOG_DEBUG("pg", "Query: " + msg.query);
 
     // Handle empty query
-    std::string sql = msg.query;
+    std::string sql = std::move(msg.query);
     // Trim whitespace
     sql.erase(0, sql.find_first_not_of(" \t\n\r"));
     sql.erase(sql.find_last_not_of(" \t\n\r") + 1);
@@ -389,7 +398,8 @@ void PgHandler::WriteQueryResult(PgMessageWriter& writer, duckdb::QueryResult& r
     std::vector<std::string> names;
     std::vector<duckdb::LogicalType> types;
 
-    for (size_t i = 0; i < result.ColumnCount(); i++) {
+    idx_t col_count = result.ColumnCount();
+    for (idx_t i = 0; i < col_count; i++) {
         names.push_back(result.ColumnName(i));
         types.push_back(result.types[i]);
     }
@@ -399,20 +409,15 @@ void PgHandler::WriteQueryResult(PgMessageWriter& writer, duckdb::QueryResult& r
         writer.WriteRowDescription(names, types);
     }
 
-    // Send data rows
+    // Send data rows using column-vector direct path
     rows_affected = 0;
-    std::vector<duckdb::Value> row_values;
     while (true) {
         auto chunk = result.Fetch();
         if (!chunk || chunk->size() == 0) break;
 
-        row_values.reserve(chunk->ColumnCount());
-        for (size_t row = 0; row < chunk->size(); row++) {
-            row_values.clear();
-            for (size_t col = 0; col < chunk->ColumnCount(); col++) {
-                row_values.push_back(chunk->GetValue(col, row));
-            }
-            writer.WriteDataRow(row_values);
+        auto unified = chunk->ToUnifiedFormat();
+        for (idx_t row = 0; row < chunk->size(); row++) {
+            writer.WriteDataRowDirect(unified, types, row, col_count, chunk.get());
             rows_affected++;
         }
     }
@@ -621,7 +626,6 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
             last_connection_ = &conn;
 
             // Find the (potentially revalidated) statement
-            auto stmt_it = prepared_statements_.find(query);
             duckdb::shared_ptr<duckdb::PreparedStatement> exec_stmt;
 
             // Search by query text since name may vary
@@ -656,23 +660,26 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
 
             PgMessageWriter writer;
 
-            // Send data rows
+            // Collect types for direct formatting
+            std::vector<duckdb::LogicalType> types;
+            idx_t col_count = result->ColumnCount();
+            types.reserve(col_count);
+            for (idx_t i = 0; i < col_count; i++) {
+                types.push_back(result->types[i]);
+            }
+
+            // Send data rows using column-vector direct path
             uint64_t row_count = 0;
-            std::vector<duckdb::Value> row_values;
             while (true) {
                 auto chunk = result->Fetch();
                 if (!chunk || chunk->size() == 0) break;
 
-                row_values.reserve(chunk->ColumnCount());
-                for (size_t row = 0; row < chunk->size(); row++) {
+                auto unified = chunk->ToUnifiedFormat();
+                for (idx_t row = 0; row < chunk->size(); row++) {
                     if (max_rows > 0 && row_count >= static_cast<uint64_t>(max_rows)) {
                         break;
                     }
-                    row_values.clear();
-                    for (size_t col = 0; col < chunk->ColumnCount(); col++) {
-                        row_values.push_back(chunk->GetValue(col, row));
-                    }
-                    writer.WriteDataRow(row_values);
+                    writer.WriteDataRowDirect(unified, types, row, col_count, chunk.get());
                     row_count++;
                 }
                 if (max_rows > 0 && row_count >= static_cast<uint64_t>(max_rows)) {
@@ -774,46 +781,46 @@ char PgHandler::GetTransactionStatus() const {
 }
 
 std::string PgHandler::GetCommandTag(const std::string& sql, uint64_t rows_affected) {
-    // Only uppercase a short prefix for command detection
-    auto prefix = GetUpperPrefix(sql, 30);
+    const char* s = sql.data();
+    size_t len = sql.size();
 
-    if (prefix.rfind("SELECT", 0) == 0 || prefix.rfind("WITH", 0) == 0) {
+    if (SqlStartsWithCI(s, len, "SELECT") || SqlStartsWithCI(s, len, "WITH")) {
         return "SELECT " + std::to_string(rows_affected);
-    } else if (prefix.rfind("INSERT", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "INSERT")) {
         return "INSERT 0 " + std::to_string(rows_affected);
-    } else if (prefix.rfind("UPDATE", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "UPDATE")) {
         return "UPDATE " + std::to_string(rows_affected);
-    } else if (prefix.rfind("DELETE", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "DELETE")) {
         return "DELETE " + std::to_string(rows_affected);
-    } else if (prefix.rfind("CREATE", 0) == 0) {
-        if (prefix.find("TABLE") != std::string::npos) {
+    } else if (SqlStartsWithCI(s, len, "CREATE")) {
+        if (SqlContainsCI(s, len, 6, "TABLE", 25)) {
             return "CREATE TABLE";
-        } else if (prefix.find("INDEX") != std::string::npos) {
+        } else if (SqlContainsCI(s, len, 6, "INDEX", 25)) {
             return "CREATE INDEX";
-        } else if (prefix.find("VIEW") != std::string::npos) {
+        } else if (SqlContainsCI(s, len, 6, "VIEW", 25)) {
             return "CREATE VIEW";
-        } else if (prefix.find("SCHEMA") != std::string::npos) {
+        } else if (SqlContainsCI(s, len, 6, "SCHEMA", 25)) {
             return "CREATE SCHEMA";
         }
         return "CREATE";
-    } else if (prefix.rfind("DROP", 0) == 0) {
-        if (prefix.find("TABLE") != std::string::npos) {
+    } else if (SqlStartsWithCI(s, len, "DROP")) {
+        if (SqlContainsCI(s, len, 4, "TABLE", 20)) {
             return "DROP TABLE";
         }
         return "DROP";
-    } else if (prefix.rfind("ALTER", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "ALTER")) {
         return "ALTER TABLE";
-    } else if (prefix.rfind("BEGIN", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "BEGIN")) {
         return "BEGIN";
-    } else if (prefix.rfind("COMMIT", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "COMMIT")) {
         return "COMMIT";
-    } else if (prefix.rfind("ROLLBACK", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "ROLLBACK")) {
         return "ROLLBACK";
-    } else if (prefix.rfind("SET", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "SET")) {
         return "SET";
-    } else if (prefix.rfind("SHOW", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "SHOW")) {
         return "SHOW";
-    } else if (prefix.rfind("COPY", 0) == 0) {
+    } else if (SqlStartsWithCI(s, len, "COPY")) {
         return "COPY " + std::to_string(rows_affected);
     }
 

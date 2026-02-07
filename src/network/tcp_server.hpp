@@ -10,9 +10,7 @@
 
 #include "common.hpp"
 #include "network/io_context_pool.hpp"
-#include "network/tcp_connection.hpp"
 #include <asio.hpp>
-#include <set>
 
 namespace duckdb_server {
 
@@ -46,10 +44,10 @@ public:
     // Get executor pool
     std::shared_ptr<ExecutorPool> GetExecutorPool() { return executor_pool_; }
     
-    // Connection management
-    void AddConnection(TcpConnectionPtr conn);
-    void RemoveConnection(TcpConnectionPtr conn);
-    size_t GetConnectionCount() const;
+    // Active connection count (for metrics)
+    size_t GetConnectionCount() const { return active_connections_; }
+    void IncrementConnections() { active_connections_++; total_connections_++; }
+    void DecrementConnections() { active_connections_--; }
     
     // Get config
     const ServerConfig& GetConfig() const { return config_; }
@@ -83,9 +81,8 @@ private:
     // Executor pool
     std::shared_ptr<ExecutorPool> executor_pool_;
     
-    // Active connections
-    std::set<TcpConnectionPtr> connections_;
-    mutable std::mutex connections_mutex_;
+    // Active connection count
+    std::atomic<size_t> active_connections_;
     
     // Running flag
     std::atomic<bool> running_;

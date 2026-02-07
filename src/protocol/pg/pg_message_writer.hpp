@@ -113,6 +113,37 @@ public:
         EndMessage();
     }
 
+    // Write a data row directly from column vectors (no Value objects).
+    // For unsupported types, falls back to chunk->GetValue().
+    void WriteDataRowDirect(const duckdb::unsafe_unique_array<duckdb::UnifiedVectorFormat>& col_data,
+                            const std::vector<duckdb::LogicalType>& types,
+                            idx_t row_idx,
+                            idx_t col_count,
+                            duckdb::DataChunk* chunk) {
+        StartMessage(BackendMessage::DataRow);
+        WriteInt16(static_cast<int16_t>(col_count));
+
+        for (idx_t col = 0; col < col_count; col++) {
+            if (FormatCellDirect(col_data[col], row_idx, types[col], format_buffer_)) {
+                WriteInt32(static_cast<int32_t>(format_buffer_.size()));
+                WriteRawBytes(format_buffer_.data(), format_buffer_.size());
+            } else {
+                // FormatCellDirect returns false for NULL or unsupported types
+                auto idx = col_data[col].sel->get_index(row_idx);
+                if (!col_data[col].validity.RowIsValid(idx)) {
+                    WriteInt32(-1);  // NULL
+                } else {
+                    // Unsupported type: fall back to GetValue
+                    auto value = chunk->GetValue(col, row_idx);
+                    FormatValueInto(value, format_buffer_);
+                    WriteInt32(static_cast<int32_t>(format_buffer_.size()));
+                    WriteRawBytes(format_buffer_.data(), format_buffer_.size());
+                }
+            }
+        }
+        EndMessage();
+    }
+
     void WriteCommandComplete(const std::string& tag) {
         StartMessage(BackendMessage::CommandComplete);
         WriteString(tag);

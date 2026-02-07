@@ -9,6 +9,12 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/interval.hpp"
+#include "duckdb/common/types/string_type.hpp"
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
 #include <unordered_map>
@@ -205,26 +211,26 @@ inline void FormatValueInto(const duckdb::Value& value, std::string& out) {
             return;
         case duckdb::LogicalTypeId::TINYINT: {
             char buf[5];
-            int n = snprintf(buf, sizeof(buf), "%d", static_cast<int>(value.GetValue<int8_t>()));
-            out.assign(buf, n);
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value.GetValue<int8_t>());
+            out.assign(buf, ptr);
             return;
         }
         case duckdb::LogicalTypeId::SMALLINT: {
             char buf[7];
-            int n = snprintf(buf, sizeof(buf), "%d", static_cast<int>(value.GetValue<int16_t>()));
-            out.assign(buf, n);
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value.GetValue<int16_t>());
+            out.assign(buf, ptr);
             return;
         }
         case duckdb::LogicalTypeId::INTEGER: {
             char buf[12];
-            int n = snprintf(buf, sizeof(buf), "%d", value.GetValue<int32_t>());
-            out.assign(buf, n);
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value.GetValue<int32_t>());
+            out.assign(buf, ptr);
             return;
         }
         case duckdb::LogicalTypeId::BIGINT: {
             char buf[21];
-            int n = snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value.GetValue<int64_t>()));
-            out.assign(buf, n);
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value.GetValue<int64_t>());
+            out.assign(buf, ptr);
             return;
         }
         case duckdb::LogicalTypeId::FLOAT: {
@@ -242,6 +248,223 @@ inline void FormatValueInto(const duckdb::Value& value, std::string& out) {
         default:
             out = value.ToString();
             return;
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Direct Cell Formatting (bypasses duckdb::Value allocation)
+//===----------------------------------------------------------------------===//
+
+// Helper: write zero-padded integer into buffer, returns pointer past end
+inline char* WritePadded(char* buf, int32_t val, int width) {
+    // Write digits right-to-left
+    char* end = buf + width;
+    char* p = end;
+    int32_t v = val < 0 ? -val : val;
+    while (p > buf) {
+        *(--p) = '0' + static_cast<char>(v % 10);
+        v /= 10;
+    }
+    return end;
+}
+
+// Format a cell directly from raw column data into buffer.
+// Returns false if NULL (out is not modified).
+inline bool FormatCellDirect(const duckdb::UnifiedVectorFormat& col_data,
+                             idx_t row_idx,
+                             const duckdb::LogicalType& type,
+                             std::string& out) {
+    auto idx = col_data.sel->get_index(row_idx);
+    if (!col_data.validity.RowIsValid(idx)) {
+        return false;  // NULL
+    }
+
+    switch (type.id()) {
+        case duckdb::LogicalTypeId::BOOLEAN: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<bool>(col_data)[idx];
+            out = val ? "t" : "f";
+            return true;
+        }
+        case duckdb::LogicalTypeId::TINYINT: {
+            char buf[5];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int8_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::SMALLINT: {
+            char buf[7];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int16_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::INTEGER: {
+            char buf[12];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int32_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::BIGINT: {
+            char buf[21];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int64_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::UTINYINT: {
+            char buf[4];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<uint8_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::USMALLINT: {
+            char buf[6];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<uint16_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::UINTEGER: {
+            char buf[11];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<uint32_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::UBIGINT: {
+            char buf[21];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<uint64_t>(col_data)[idx];
+            auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+            out.assign(buf, ptr);
+            return true;
+        }
+        case duckdb::LogicalTypeId::FLOAT: {
+            char buf[16];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<float>(col_data)[idx];
+            int n = snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(val));
+            out.assign(buf, n);
+            return true;
+        }
+        case duckdb::LogicalTypeId::DOUBLE: {
+            char buf[32];
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<double>(col_data)[idx];
+            int n = snprintf(buf, sizeof(buf), "%.17g", val);
+            out.assign(buf, n);
+            return true;
+        }
+        case duckdb::LogicalTypeId::VARCHAR: {
+            auto str = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::string_t>(col_data)[idx];
+            out.assign(str.GetData(), str.GetSize());
+            return true;
+        }
+        case duckdb::LogicalTypeId::DATE: {
+            auto date = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::date_t>(col_data)[idx];
+            int32_t year, month, day;
+            duckdb::Date::Convert(date, year, month, day);
+            // "YYYY-MM-DD" = max 15 chars (negative years)
+            char buf[16];
+            char* p = buf;
+            if (year < 0) {
+                *p++ = '-';
+                year = -year;
+            }
+            // Year: variable width
+            auto [yp, yec] = std::to_chars(p, buf + sizeof(buf), year);
+            // Pad year to at least 4 digits
+            int ylen = static_cast<int>(yp - p);
+            if (ylen < 4) {
+                // Shift right and pad with zeros
+                int pad = 4 - ylen;
+                std::memmove(p + pad, p, ylen);
+                std::memset(p, '0', pad);
+                yp = p + 4;
+            }
+            p = yp;
+            *p++ = '-';
+            p = WritePadded(p, month, 2);
+            *p++ = '-';
+            p = WritePadded(p, day, 2);
+            out.assign(buf, p);
+            return true;
+        }
+        case duckdb::LogicalTypeId::TIME: {
+            auto time = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::dtime_t>(col_data)[idx];
+            int32_t hour, min, sec, micros;
+            duckdb::Time::Convert(time, hour, min, sec, micros);
+            // "HH:MM:SS[.ffffff]"
+            char buf[16];
+            char* p = WritePadded(buf, hour, 2);
+            *p++ = ':';
+            p = WritePadded(p, min, 2);
+            *p++ = ':';
+            p = WritePadded(p, sec, 2);
+            if (micros > 0) {
+                *p++ = '.';
+                p = WritePadded(p, micros, 6);
+                // Trim trailing zeros
+                while (p > buf && *(p - 1) == '0') --p;
+            }
+            out.assign(buf, p);
+            return true;
+        }
+        case duckdb::LogicalTypeId::TIMESTAMP:
+        case duckdb::LogicalTypeId::TIMESTAMP_TZ: {
+            auto ts = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::timestamp_t>(col_data)[idx];
+            duckdb::date_t date_part;
+            duckdb::dtime_t time_part;
+            duckdb::Timestamp::Convert(ts, date_part, time_part);
+
+            int32_t year, month, day;
+            duckdb::Date::Convert(date_part, year, month, day);
+            int32_t hour, min, sec, micros;
+            duckdb::Time::Convert(time_part, hour, min, sec, micros);
+
+            // "YYYY-MM-DD HH:MM:SS[.ffffff]" = max ~32 chars
+            char buf[36];
+            char* p = buf;
+            if (year < 0) {
+                *p++ = '-';
+                year = -year;
+            }
+            auto [yp, yec] = std::to_chars(p, buf + sizeof(buf), year);
+            int ylen = static_cast<int>(yp - p);
+            if (ylen < 4) {
+                int pad = 4 - ylen;
+                std::memmove(p + pad, p, ylen);
+                std::memset(p, '0', pad);
+                yp = p + 4;
+            }
+            p = yp;
+            *p++ = '-';
+            p = WritePadded(p, month, 2);
+            *p++ = '-';
+            p = WritePadded(p, day, 2);
+            *p++ = ' ';
+            p = WritePadded(p, hour, 2);
+            *p++ = ':';
+            p = WritePadded(p, min, 2);
+            *p++ = ':';
+            p = WritePadded(p, sec, 2);
+            if (micros > 0) {
+                *p++ = '.';
+                p = WritePadded(p, micros, 6);
+                while (p > buf && *(p - 1) == '0') --p;
+            }
+            out.assign(buf, p);
+            return true;
+        }
+        case duckdb::LogicalTypeId::INTERVAL: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::interval_t>(col_data)[idx];
+            out = duckdb::Interval::ToString(val);
+            return true;
+        }
+        default:
+            // Fallback: use Value::ToString() via chunk GetValue
+            // Caller must handle this case by falling back to GetValue path
+            return false;
     }
 }
 

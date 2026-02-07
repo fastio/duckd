@@ -69,6 +69,10 @@ void PgConnection::Close() {
     LOG_DEBUG("pg_conn", "Close() called, cleaning up resources");
     closed_ = true;
 
+    if (server_) {
+        server_->DecrementConnections();
+    }
+
     // IMPORTANT: Remove session from SessionManager first.
     // The SessionManager holds a shared_ptr<Session> in its sessions_ map.
     // Without removing it, the Session and PooledConnection would be kept alive

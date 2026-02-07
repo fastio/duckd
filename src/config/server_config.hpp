@@ -18,18 +18,11 @@
 
 namespace duckdb_server {
 
-// Protocol type
-enum class ProtocolType {
-    Native,      // Custom DuckD protocol
-    PostgreSQL   // PostgreSQL wire protocol
-};
-
 struct ServerConfig {
     // Network
     std::string host = "0.0.0.0";
     uint16_t port = 5432;  // Default to PostgreSQL port
     uint16_t http_port = 0;  // 0 = disabled, for health/metrics
-    ProtocolType protocol = ProtocolType::PostgreSQL;
 
     // Database
     std::string database_path = ":memory:";
@@ -134,14 +127,6 @@ struct ServerConfig {
         if (cfg.Has("pool_idle_timeout")) pool_idle_timeout_seconds = static_cast<uint32_t>(cfg.GetInt("pool_idle_timeout"));
         if (cfg.Has("pool_acquire_timeout")) pool_acquire_timeout_ms = static_cast<uint32_t>(cfg.GetInt("pool_acquire_timeout"));
         if (cfg.Has("pool_validate_on_acquire")) pool_validate_on_acquire = cfg.GetBool("pool_validate_on_acquire");
-        if (cfg.Has("protocol")) {
-            std::string proto = cfg.GetString("protocol");
-            if (proto == "postgresql" || proto == "pg") {
-                protocol = ProtocolType::PostgreSQL;
-            } else if (proto == "native") {
-                protocol = ProtocolType::Native;
-            }
-        }
 
         return true;
     }
@@ -158,14 +143,6 @@ struct ServerConfig {
         if (cfg.Has("server.host")) host = cfg.GetString("server.host");
         if (cfg.Has("server.port")) port = static_cast<uint16_t>(cfg.GetInt("server.port"));
         if (cfg.Has("server.http_port")) http_port = static_cast<uint16_t>(cfg.GetInt("server.http_port"));
-        if (cfg.Has("server.protocol")) {
-            std::string proto = cfg.GetString("server.protocol");
-            if (proto == "postgresql" || proto == "pg") {
-                protocol = ProtocolType::PostgreSQL;
-            } else if (proto == "native") {
-                protocol = ProtocolType::Native;
-            }
-        }
 
         // Database section
         if (cfg.Has("database.path")) database_path = cfg.GetString("database.path");
@@ -208,7 +185,6 @@ inline void PrintUsage(const char* program) {
               << "  -h, --host <host>       Host to bind (default: 0.0.0.0)\n"
               << "  -p, --port <port>       Port to bind (default: 5432)\n"
               << "  -d, --database <path>   Database path (default: :memory:)\n"
-              << "  --protocol <type>       Protocol: postgresql (default), native\n"
               << "  --daemon                Run as daemon (background)\n"
               << "  --pid-file <path>       PID file path\n"
               << "  --user <name>           User to run as (drops privileges)\n"
@@ -292,13 +268,6 @@ inline ServerConfig ParseCommandLine(int argc, char* argv[], bool& show_version)
             config.max_open_files = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--query-timeout" && i + 1 < argc) {
             config.query_timeout_ms = static_cast<uint32_t>(std::stoi(argv[++i]));
-        } else if (arg == "--protocol" && i + 1 < argc) {
-            std::string proto = argv[++i];
-            if (proto == "postgresql" || proto == "pg") {
-                config.protocol = ProtocolType::PostgreSQL;
-            } else if (proto == "native") {
-                config.protocol = ProtocolType::Native;
-            }
         } else if (arg == "--pool-min" && i + 1 < argc) {
             config.pool_min_connections = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--pool-max" && i + 1 < argc) {

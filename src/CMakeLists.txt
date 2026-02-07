@@ -7,14 +7,7 @@ set(DUCKD_SERVER_SOURCES
     # Network layer
     ${DUCKD_SRC_DIR}/network/io_context_pool.cpp
     ${DUCKD_SRC_DIR}/network/tcp_server.cpp
-    ${DUCKD_SRC_DIR}/network/tcp_connection.cpp
     ${DUCKD_SRC_DIR}/network/pg_connection.cpp
-
-    # Protocol layer (native)
-    ${DUCKD_SRC_DIR}/protocol/message.cpp
-    ${DUCKD_SRC_DIR}/protocol/message_parser.cpp
-    ${DUCKD_SRC_DIR}/protocol/message_builder.cpp
-    ${DUCKD_SRC_DIR}/protocol/protocol_handler.cpp
 
     # Protocol layer (PostgreSQL)
     ${DUCKD_SRC_DIR}/protocol/pg/pg_handler.cpp
@@ -24,11 +17,7 @@ set(DUCKD_SERVER_SOURCES
     ${DUCKD_SRC_DIR}/session/session_manager.cpp
     ${DUCKD_SRC_DIR}/session/connection_pool.cpp
 
-    # Serialization
-    ${DUCKD_SRC_DIR}/serialization/arrow_serializer.cpp
-
     # Executor
-    ${DUCKD_SRC_DIR}/executor/query_executor.cpp
     ${DUCKD_SRC_DIR}/executor/executor_pool.cpp
 
     # HTTP
