@@ -36,7 +36,11 @@ PgHandler::PgHandler(std::shared_ptr<Session> session, SendCallback send_callbac
 PgHandler::~PgHandler() = default;
 
 ProcessResult PgHandler::ProcessData(const uint8_t* data, size_t len) {
-    // Append to buffer
+    // Compact buffer if offset has consumed more than half
+    if (buffer_offset_ > 0 && buffer_offset_ >= buffer_.size() / 2) {
+        buffer_.erase(buffer_.begin(), buffer_.begin() + buffer_offset_);
+        buffer_offset_ = 0;
+    }
     buffer_.insert(buffer_.end(), data, data + len);
     return ProcessBufferLoop();
 }
@@ -47,59 +51,62 @@ ProcessResult PgHandler::ProcessPendingBuffer() {
 }
 
 ProcessResult PgHandler::ProcessBufferLoop() {
-    while (!buffer_.empty()) {
+    while (buffer_offset_ < buffer_.size()) {
         // If an async operation is pending, stop processing
         if (async_pending_) {
             return ProcessResult::AsyncPending;
         }
 
+        const uint8_t* buf = buffer_.data() + buffer_offset_;
+        size_t remaining = buffer_.size() - buffer_offset_;
+
         if (state_ == PgConnectionState::Initial) {
             // Startup message: length(4) + content
-            if (buffer_.size() < 4) return ProcessResult::Continue;
+            if (remaining < 4) return ProcessResult::Continue;
 
             int32_t msg_len;
-            std::memcpy(&msg_len, buffer_.data(), 4);
+            std::memcpy(&msg_len, buf, 4);
             msg_len = NetworkToHost32(msg_len);
 
-            if (msg_len < 4 || static_cast<size_t>(msg_len) > buffer_.size()) {
+            if (msg_len < 4 || static_cast<size_t>(msg_len) > remaining) {
                 return ProcessResult::Continue;  // Need more data
             }
 
-            bool result = HandleStartup(buffer_.data(), msg_len);
-            buffer_.erase(buffer_.begin(), buffer_.begin() + msg_len);
+            bool result = HandleStartup(buf, msg_len);
+            buffer_offset_ += msg_len;
             if (!result) return ProcessResult::Close;
         }
         else if (state_ == PgConnectionState::Authenticating) {
             // Password message: type(1) + length(4) + content
-            if (buffer_.size() < 5) return ProcessResult::Continue;
+            if (remaining < 5) return ProcessResult::Continue;
 
             int32_t msg_len;
-            std::memcpy(&msg_len, buffer_.data() + 1, 4);
+            std::memcpy(&msg_len, buf + 1, 4);
             msg_len = NetworkToHost32(msg_len);
 
-            if (static_cast<size_t>(msg_len + 1) > buffer_.size()) {
+            if (static_cast<size_t>(msg_len + 1) > remaining) {
                 return ProcessResult::Continue;  // Need more data
             }
 
-            bool result = HandleAuthentication(buffer_.data() + 5, msg_len - 4);
-            buffer_.erase(buffer_.begin(), buffer_.begin() + msg_len + 1);
+            bool result = HandleAuthentication(buf + 5, msg_len - 4);
+            buffer_offset_ += msg_len + 1;
             if (!result) return ProcessResult::Close;
         }
         else {
             // Regular message: type(1) + length(4) + content
-            if (buffer_.size() < 5) return ProcessResult::Continue;
+            if (remaining < 5) return ProcessResult::Continue;
 
-            char type = static_cast<char>(buffer_[0]);
+            char type = static_cast<char>(buf[0]);
             int32_t msg_len;
-            std::memcpy(&msg_len, buffer_.data() + 1, 4);
+            std::memcpy(&msg_len, buf + 1, 4);
             msg_len = NetworkToHost32(msg_len);
 
-            if (static_cast<size_t>(msg_len + 1) > buffer_.size()) {
+            if (static_cast<size_t>(msg_len + 1) > remaining) {
                 return ProcessResult::Continue;  // Need more data
             }
 
-            bool result = HandleMessage(type, buffer_.data() + 5, msg_len - 4);
-            buffer_.erase(buffer_.begin(), buffer_.begin() + msg_len + 1);
+            bool result = HandleMessage(type, buf + 5, msg_len - 4);
+            buffer_offset_ += msg_len + 1;
             if (!result) return ProcessResult::Close;
 
             // Check if HandleMessage triggered an async operation
@@ -109,6 +116,10 @@ ProcessResult PgHandler::ProcessBufferLoop() {
         }
     }
 
+    // All data consumed, reset buffer
+    buffer_.clear();
+    buffer_offset_ = 0;
+
     return ProcessResult::Continue;
 }
 
@@ -116,15 +127,27 @@ bool PgHandler::CanReleaseConnection() const {
     return !in_transaction_ && prepared_statements_.empty();
 }
 
-void PgHandler::UpdateTransactionState(const std::string& sql) {
-    std::string upper_sql = sql;
-    std::transform(upper_sql.begin(), upper_sql.end(), upper_sql.begin(), ::toupper);
+// Extract uppercase prefix of SQL (skipping leading whitespace, up to max_len chars)
+static std::string GetUpperPrefix(const std::string& sql, size_t max_len = 20) {
+    size_t start = 0;
+    while (start < sql.size() && std::isspace(static_cast<unsigned char>(sql[start]))) start++;
+    std::string prefix;
+    size_t end = std::min(sql.size(), start + max_len);
+    prefix.reserve(end - start);
+    for (size_t i = start; i < end; i++) {
+        prefix += static_cast<char>(std::toupper(static_cast<unsigned char>(sql[i])));
+    }
+    return prefix;
+}
 
-    if (upper_sql.find("BEGIN") != std::string::npos) {
+void PgHandler::UpdateTransactionState(const std::string& sql) {
+    auto prefix = GetUpperPrefix(sql, 10);
+
+    if (prefix.find("BEGIN") != std::string::npos) {
         in_transaction_ = true;
         transaction_failed_ = false;
-    } else if (upper_sql.find("COMMIT") != std::string::npos ||
-               upper_sql.find("ROLLBACK") != std::string::npos) {
+    } else if (prefix.find("COMMIT") != std::string::npos ||
+               prefix.find("ROLLBACK") != std::string::npos) {
         in_transaction_ = false;
         transaction_failed_ = false;
     }
@@ -378,12 +401,14 @@ void PgHandler::WriteQueryResult(PgMessageWriter& writer, duckdb::QueryResult& r
 
     // Send data rows
     rows_affected = 0;
+    std::vector<duckdb::Value> row_values;
     while (true) {
         auto chunk = result.Fetch();
         if (!chunk || chunk->size() == 0) break;
 
+        row_values.reserve(chunk->ColumnCount());
         for (size_t row = 0; row < chunk->size(); row++) {
-            std::vector<duckdb::Value> row_values;
+            row_values.clear();
             for (size_t col = 0; col < chunk->ColumnCount(); col++) {
                 row_values.push_back(chunk->GetValue(col, row));
             }
@@ -633,15 +658,17 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
 
             // Send data rows
             uint64_t row_count = 0;
+            std::vector<duckdb::Value> row_values;
             while (true) {
                 auto chunk = result->Fetch();
                 if (!chunk || chunk->size() == 0) break;
 
+                row_values.reserve(chunk->ColumnCount());
                 for (size_t row = 0; row < chunk->size(); row++) {
                     if (max_rows > 0 && row_count >= static_cast<uint64_t>(max_rows)) {
                         break;
                     }
-                    std::vector<duckdb::Value> row_values;
+                    row_values.clear();
                     for (size_t col = 0; col < chunk->ColumnCount(); col++) {
                         row_values.push_back(chunk->GetValue(col, row));
                     }
@@ -747,52 +774,46 @@ char PgHandler::GetTransactionStatus() const {
 }
 
 std::string PgHandler::GetCommandTag(const std::string& sql, uint64_t rows_affected) {
-    std::string upper_sql = sql;
-    std::transform(upper_sql.begin(), upper_sql.end(), upper_sql.begin(), ::toupper);
+    // Only uppercase a short prefix for command detection
+    auto prefix = GetUpperPrefix(sql, 30);
 
-    // Remove leading whitespace
-    size_t start = upper_sql.find_first_not_of(" \t\n\r");
-    if (start != std::string::npos) {
-        upper_sql = upper_sql.substr(start);
-    }
-
-    if (upper_sql.rfind("SELECT", 0) == 0 || upper_sql.rfind("WITH", 0) == 0) {
+    if (prefix.rfind("SELECT", 0) == 0 || prefix.rfind("WITH", 0) == 0) {
         return "SELECT " + std::to_string(rows_affected);
-    } else if (upper_sql.rfind("INSERT", 0) == 0) {
+    } else if (prefix.rfind("INSERT", 0) == 0) {
         return "INSERT 0 " + std::to_string(rows_affected);
-    } else if (upper_sql.rfind("UPDATE", 0) == 0) {
+    } else if (prefix.rfind("UPDATE", 0) == 0) {
         return "UPDATE " + std::to_string(rows_affected);
-    } else if (upper_sql.rfind("DELETE", 0) == 0) {
+    } else if (prefix.rfind("DELETE", 0) == 0) {
         return "DELETE " + std::to_string(rows_affected);
-    } else if (upper_sql.rfind("CREATE", 0) == 0) {
-        if (upper_sql.find("TABLE") != std::string::npos) {
+    } else if (prefix.rfind("CREATE", 0) == 0) {
+        if (prefix.find("TABLE") != std::string::npos) {
             return "CREATE TABLE";
-        } else if (upper_sql.find("INDEX") != std::string::npos) {
+        } else if (prefix.find("INDEX") != std::string::npos) {
             return "CREATE INDEX";
-        } else if (upper_sql.find("VIEW") != std::string::npos) {
+        } else if (prefix.find("VIEW") != std::string::npos) {
             return "CREATE VIEW";
-        } else if (upper_sql.find("SCHEMA") != std::string::npos) {
+        } else if (prefix.find("SCHEMA") != std::string::npos) {
             return "CREATE SCHEMA";
         }
         return "CREATE";
-    } else if (upper_sql.rfind("DROP", 0) == 0) {
-        if (upper_sql.find("TABLE") != std::string::npos) {
+    } else if (prefix.rfind("DROP", 0) == 0) {
+        if (prefix.find("TABLE") != std::string::npos) {
             return "DROP TABLE";
         }
         return "DROP";
-    } else if (upper_sql.rfind("ALTER", 0) == 0) {
+    } else if (prefix.rfind("ALTER", 0) == 0) {
         return "ALTER TABLE";
-    } else if (upper_sql.rfind("BEGIN", 0) == 0) {
+    } else if (prefix.rfind("BEGIN", 0) == 0) {
         return "BEGIN";
-    } else if (upper_sql.rfind("COMMIT", 0) == 0) {
+    } else if (prefix.rfind("COMMIT", 0) == 0) {
         return "COMMIT";
-    } else if (upper_sql.rfind("ROLLBACK", 0) == 0) {
+    } else if (prefix.rfind("ROLLBACK", 0) == 0) {
         return "ROLLBACK";
-    } else if (upper_sql.rfind("SET", 0) == 0) {
+    } else if (prefix.rfind("SET", 0) == 0) {
         return "SET";
-    } else if (upper_sql.rfind("SHOW", 0) == 0) {
+    } else if (prefix.rfind("SHOW", 0) == 0) {
         return "SHOW";
-    } else if (upper_sql.rfind("COPY", 0) == 0) {
+    } else if (prefix.rfind("COPY", 0) == 0) {
         return "COPY " + std::to_string(rows_affected);
     }
 

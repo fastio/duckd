@@ -10,6 +10,7 @@
 
 #include "duckdb.hpp"
 #include <cstdint>
+#include <cstdio>
 #include <unordered_map>
 #include <string>
 
@@ -187,6 +188,61 @@ inline std::string FormatValue(const duckdb::Value& value) {
         return "";  // NULL handled separately
     }
     return value.ToString();
+}
+
+//===----------------------------------------------------------------------===//
+// Value Formatting Into Existing Buffer (avoids allocation for common types)
+//===----------------------------------------------------------------------===//
+inline void FormatValueInto(const duckdb::Value& value, std::string& out) {
+    if (value.IsNull()) {
+        out.clear();
+        return;
+    }
+    auto type_id = value.type().id();
+    switch (type_id) {
+        case duckdb::LogicalTypeId::BOOLEAN:
+            out = value.GetValue<bool>() ? "t" : "f";
+            return;
+        case duckdb::LogicalTypeId::TINYINT: {
+            char buf[5];
+            int n = snprintf(buf, sizeof(buf), "%d", static_cast<int>(value.GetValue<int8_t>()));
+            out.assign(buf, n);
+            return;
+        }
+        case duckdb::LogicalTypeId::SMALLINT: {
+            char buf[7];
+            int n = snprintf(buf, sizeof(buf), "%d", static_cast<int>(value.GetValue<int16_t>()));
+            out.assign(buf, n);
+            return;
+        }
+        case duckdb::LogicalTypeId::INTEGER: {
+            char buf[12];
+            int n = snprintf(buf, sizeof(buf), "%d", value.GetValue<int32_t>());
+            out.assign(buf, n);
+            return;
+        }
+        case duckdb::LogicalTypeId::BIGINT: {
+            char buf[21];
+            int n = snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value.GetValue<int64_t>()));
+            out.assign(buf, n);
+            return;
+        }
+        case duckdb::LogicalTypeId::FLOAT: {
+            char buf[16];
+            int n = snprintf(buf, sizeof(buf), "%.9g", value.GetValue<float>());
+            out.assign(buf, n);
+            return;
+        }
+        case duckdb::LogicalTypeId::DOUBLE: {
+            char buf[32];
+            int n = snprintf(buf, sizeof(buf), "%.17g", value.GetValue<double>());
+            out.assign(buf, n);
+            return;
+        }
+        default:
+            out = value.ToString();
+            return;
+    }
 }
 
 } // namespace pg

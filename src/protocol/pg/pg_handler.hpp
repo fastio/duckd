@@ -165,6 +165,7 @@ private:
 
     // Buffer for incomplete messages
     std::vector<uint8_t> buffer_;
+    size_t buffer_offset_ = 0;
 };
 
 } // namespace pg

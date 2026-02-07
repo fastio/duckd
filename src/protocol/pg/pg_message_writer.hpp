@@ -105,9 +105,9 @@ public:
             if (value.IsNull()) {
                 WriteInt32(-1);  // NULL
             } else {
-                std::string str = FormatValue(value);
-                WriteInt32(static_cast<int32_t>(str.size()));
-                WriteRawBytes(str.data(), str.size());
+                FormatValueInto(value, format_buffer_);
+                WriteInt32(static_cast<int32_t>(format_buffer_.size()));
+                WriteRawBytes(format_buffer_.data(), format_buffer_.size());
             }
         }
         EndMessage();
@@ -242,6 +242,7 @@ private:
 private:
     std::vector<uint8_t> buffer_;
     size_t message_start_ = 0;
+    std::string format_buffer_;  // Reusable formatting buffer for WriteDataRow
 };
 
 } // namespace pg
