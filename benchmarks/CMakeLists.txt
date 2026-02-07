@@ -64,6 +64,26 @@ target_compile_features(bench_tpcb PUBLIC cxx_std_17)
 target_compile_definitions(bench_tpcb PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
 
 #===----------------------------------------------------------------------===//
+# TPC-H Benchmark
+#===----------------------------------------------------------------------===//
+
+add_executable(bench_tpch bench_tpch.cpp)
+target_include_directories(bench_tpch PRIVATE ${BENCHMARK_INCLUDE_DIRS})
+target_link_libraries(bench_tpch PRIVATE Threads::Threads)
+target_compile_features(bench_tpch PUBLIC cxx_std_17)
+target_compile_definitions(bench_tpch PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+
+#===----------------------------------------------------------------------===//
+# Scalability Benchmark
+#===----------------------------------------------------------------------===//
+
+add_executable(bench_scalability bench_scalability.cpp)
+target_include_directories(bench_scalability PRIVATE ${BENCHMARK_INCLUDE_DIRS})
+target_link_libraries(bench_scalability PRIVATE Threads::Threads)
+target_compile_features(bench_scalability PUBLIC cxx_std_17)
+target_compile_definitions(bench_scalability PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+
+#===----------------------------------------------------------------------===//
 # Custom target to build all benchmarks
 #===----------------------------------------------------------------------===//
 
@@ -74,5 +94,7 @@ add_custom_target(benchmarks
         bench_prepared
         bench_concurrent
         bench_tpcb
+        bench_tpch
+        bench_scalability
     COMMENT "Building all benchmarks"
 )

@@ -71,6 +71,8 @@ int main(int argc, char* argv[]) {
             config.operations_per_thread = std::stoi(argv[++i]);
         } else if (arg == "-v" || arg == "--verbose") {
             config.verbose = true;
+        } else if (arg == "--json") {
+            config.json_output = true;
         } else if (arg == "--help") {
             std::cout << "Connection Benchmark\n"
                       << "Usage: " << argv[0] << " [options]\n"
@@ -83,6 +85,7 @@ int main(int argc, char* argv[]) {
                       << "  -T, --duration SECS    Test duration in seconds (default: 10)\n"
                       << "  -n, --operations N     Operations per thread (overrides duration)\n"
                       << "  -v, --verbose          Verbose output\n"
+                      << "  --json                 Output results as JSON\n"
                       << "  --help                 Show this help\n";
             return 0;
         }
@@ -93,7 +96,12 @@ int main(int argc, char* argv[]) {
     std::cout << "\nRunning benchmark...\n\n";
 
     auto result = RunBenchmark("Connection", config, ConnectionWorker);
-    result.Print();
+
+    if (config.json_output) {
+        result.PrintJson();
+    } else {
+        result.Print();
+    }
 
     return result.failed_operations > 0 ? 1 : 0;
 }

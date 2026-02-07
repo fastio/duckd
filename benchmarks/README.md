@@ -77,6 +77,50 @@ Tables created:
 - `pgbench_accounts` - 100,000 per scale factor
 - `pgbench_history` - Transaction log
 
+### 6. TPC-H Benchmark (`bench_tpch`)
+
+Runs all 22 standard TPC-H analytical queries using DuckDB's built-in tpch extension. This is the gold standard OLAP benchmark for comparing with ClickHouse, PostgreSQL, and other databases.
+
+```bash
+# Run with default scale factor (sf=1, ~1GB data)
+./bench_tpch -h 127.0.0.1 -p 5432
+
+# Run with larger scale factor
+./bench_tpch -h 127.0.0.1 -p 5432 -s 10
+
+# JSON output for automated comparison
+./bench_tpch -h 127.0.0.1 -p 5432 --json
+```
+
+Reports:
+- Per-query execution time (all 22 TPC-H queries)
+- Total query time and wall clock time
+- Geometric mean of query times (standard OLAP comparison metric)
+- Number of queries passed/failed
+
+### 7. Scalability Benchmark (`bench_scalability`)
+
+Measures throughput at increasing concurrency levels (1, 2, 4, 8, 16, 32, 64) to evaluate how well DuckD scales with more concurrent clients.
+
+```bash
+# Default: test all levels with 5s each
+./bench_scalability -h 127.0.0.1 -p 5432
+
+# Custom duration per level
+./bench_scalability -h 127.0.0.1 -p 5432 -T 10
+
+# Custom concurrency levels
+./bench_scalability -h 127.0.0.1 -p 5432 --levels 1,4,16,64
+
+# JSON output
+./bench_scalability -h 127.0.0.1 -p 5432 --json
+```
+
+Reports per concurrency level:
+- Throughput (QPS)
+- P50 and P99 latency
+- Scaling efficiency (actual QPS vs linear scaling from single-thread baseline)
+
 ## Building
 
 ```bash
@@ -103,6 +147,82 @@ Use the convenience script:
 
 # Custom configuration
 ./benchmarks/run_benchmarks.sh -h localhost -p 5433 -t 8 -T 30 --all
+
+# JSON output for all benchmarks
+./benchmarks/run_benchmarks.sh --all --json
+
+# Full report (runs all benchmarks, outputs unified JSON)
+./benchmarks/run_benchmarks.sh --report
+```
+
+## JSON Output
+
+All benchmarks support `--json` for structured output suitable for automated comparison and reporting.
+
+### Individual benchmark JSON
+
+```bash
+./build/benchmarks/bench_query --json -h 127.0.0.1 -p 5432
+```
+
+```json
+{"benchmark":"Query (SELECT_1)","total_operations":125432,"successful_operations":125432,"failed_operations":0,"total_time_s":10.001,"throughput_ops_sec":12541.85,"success_rate_pct":100.00,"latency":{"count":125432,"min_us":45.21,"max_us":2341.56,"mean_us":318.42,"stddev_us":156.78,"p50_us":289.12,"p90_us":456.78,"p95_us":612.34,"p99_us":1023.45}}
+```
+
+### TPC-H JSON output
+
+```bash
+./build/benchmarks/bench_tpch --json -h 127.0.0.1 -p 5432
+```
+
+```json
+{"benchmark":"TPC-H","scale_factor":1,"queries_passed":22,"queries_failed":0,"total_query_time_ms":4523.12,"wall_time_ms":4612.34,"geometric_mean_ms":156.78,"queries":[{"query":1,"time_ms":234.56,"status":"ok"},{"query":2,"time_ms":89.12,"status":"ok"},...]}
+```
+
+### Scalability JSON output
+
+```bash
+./build/benchmarks/bench_scalability --json -h 127.0.0.1 -p 5432
+```
+
+```json
+{"benchmark":"Scalability","duration_per_level_s":5,"baseline_qps":12500.00,"levels":[{"concurrency":1,"qps":12500.00,"p50_us":78.00,"p99_us":234.00,"scaling_efficiency_pct":100.00},{"concurrency":2,"qps":24100.00,"p50_us":81.00,"p99_us":256.00,"scaling_efficiency_pct":96.40},...]}
+```
+
+### Full report mode
+
+```bash
+./benchmarks/run_benchmarks.sh --report
+```
+
+Outputs a unified JSON document wrapping all benchmark results:
+
+```json
+{"report":"duckd-benchmark","host":"127.0.0.1","port":5432,"database":"duckd","results":[
+{"benchmark":"Connection",...},
+{"benchmark":"Query (SELECT_1)",...},
+...
+]}
+```
+
+## Cross-Database Comparison
+
+The JSON output makes it straightforward to compare DuckD against other databases:
+
+```bash
+# Run against DuckD
+./build/benchmarks/bench_tpch --json -h 127.0.0.1 -p 5432 > results_duckd.json
+
+# Run same queries against PostgreSQL (using psql timing)
+# Or use the same binary against a PG-compatible endpoint:
+./build/benchmarks/bench_query --json -h pg-host -p 5432 > results_pg.json
+
+# Compare with jq
+echo "DuckD TPC-H geometric mean:"
+jq '.geometric_mean_ms' results_duckd.json
+
+echo "DuckD query throughput:"
+jq '.throughput_ops_sec' results_duckd.json
 ```
 
 ## Command Line Options
@@ -120,7 +240,19 @@ All benchmarks share common options:
 | `-T, --duration` | Test duration (seconds) | 10 |
 | `-n, --operations` | Operations per thread | (time-based) |
 | `-v, --verbose` | Verbose output | off |
+| `--json` | Output results as JSON | off |
 | `--help` | Show help | - |
+
+TPC-H specific:
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-s, --scale` | TPC-H scale factor | 1 |
+
+Scalability specific:
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-T, --duration` | Duration per concurrency level | 5 |
+| `--levels` | Comma-separated concurrency levels | 1,2,4,8,16,32,64 |
 
 ## Output Metrics
 
@@ -185,6 +317,8 @@ The benchmark suite is designed to be comparable with PostgreSQL's pgbench:
 | `bench_query -q select1` | `pgbench -S` (select-only) |
 | `bench_prepared` | Extended query protocol |
 | `bench_tpcb` | `pgbench` (TPC-B) |
+| `bench_tpch` | TPC-H (no pgbench equivalent) |
+| `bench_scalability` | `pgbench -c N -j N` at various N |
 
 To compare with pgbench:
 
@@ -210,3 +344,9 @@ pgbench -h 127.0.0.1 -p 5432 -c 4 -j 4 -T 60 postgres
 1. Increase thread count (`-t`)
 2. Check server resources (CPU, memory)
 3. Review server configuration (max connections, thread pools)
+
+### TPC-H setup fails
+
+1. Ensure DuckDB's tpch extension is available (it's built-in for recent versions)
+2. For large scale factors, ensure sufficient memory and disk space
+3. SF=1 needs ~1GB RAM, SF=10 needs ~10GB

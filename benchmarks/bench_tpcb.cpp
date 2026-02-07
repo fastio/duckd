@@ -329,6 +329,8 @@ int main(int argc, char* argv[]) {
             config.use_prepared = false;
         } else if (arg == "-v" || arg == "--verbose") {
             config.verbose = true;
+        } else if (arg == "--json") {
+            config.json_output = true;
         } else if (arg == "--help") {
             std::cout << "TPC-B Like Benchmark (similar to pgbench)\n"
                       << "Usage: " << argv[0] << " [options]\n"
@@ -345,6 +347,7 @@ int main(int argc, char* argv[]) {
                       << "  --no-transactions      Don't use transactions\n"
                       << "  --no-prepared          Don't use prepared statements\n"
                       << "  -v, --verbose          Verbose output\n"
+                      << "  --json                 Output results as JSON\n"
                       << "  --help                 Show this help\n"
                       << "\nScale factor determines data size:\n"
                       << "  Branches: 1 per scale\n"
@@ -425,12 +428,16 @@ int main(int argc, char* argv[]) {
     result.failed_operations = failed_ops.load();
     result.total_time = end_time - start_time;
 
-    result.Print();
+    if (config.json_output) {
+        result.PrintJson();
+    } else {
+        result.Print();
 
-    // TPC-B specific output
-    std::cout << "\nTPC-B Metrics:\n"
-              << "  TPS (Transactions Per Second): "
-              << std::fixed << std::setprecision(2) << result.OperationsPerSecond() << "\n";
+        // TPC-B specific output
+        std::cout << "\nTPC-B Metrics:\n"
+                  << "  TPS (Transactions Per Second): "
+                  << std::fixed << std::setprecision(2) << result.OperationsPerSecond() << "\n";
+    }
 
     return result.failed_operations > 0 ? 1 : 0;
 }

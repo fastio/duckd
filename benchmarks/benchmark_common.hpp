@@ -17,6 +17,7 @@
 #include <iostream>
 #include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -127,6 +128,23 @@ struct LatencyStats {
                   << "  P95:    " << std::fixed << std::setprecision(2) << Percentile(95) << "\n"
                   << "  P99:    " << std::fixed << std::setprecision(2) << Percentile(99) << "\n";
     }
+
+    std::string ToJson() const {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(2);
+        os << "{"
+           << "\"count\":" << Count()
+           << ",\"min_us\":" << Min()
+           << ",\"max_us\":" << Max()
+           << ",\"mean_us\":" << Mean()
+           << ",\"stddev_us\":" << StdDev()
+           << ",\"p50_us\":" << Percentile(50)
+           << ",\"p90_us\":" << Percentile(90)
+           << ",\"p95_us\":" << Percentile(95)
+           << ",\"p99_us\":" << Percentile(99)
+           << "}";
+        return os.str();
+    }
 };
 
 //===----------------------------------------------------------------------===//
@@ -165,6 +183,22 @@ struct BenchmarkResult {
                   << SuccessRate() << "%\n\n";
         latency.Print();
     }
+
+    void PrintJson() const {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(3);
+        os << "{"
+           << "\"benchmark\":\"" << name << "\""
+           << ",\"total_operations\":" << total_operations
+           << ",\"successful_operations\":" << successful_operations
+           << ",\"failed_operations\":" << failed_operations
+           << ",\"total_time_s\":" << ToSeconds(total_time)
+           << ",\"throughput_ops_sec\":" << std::setprecision(2) << OperationsPerSecond()
+           << ",\"success_rate_pct\":" << SuccessRate()
+           << ",\"latency\":" << latency.ToJson()
+           << "}";
+        std::cout << os.str() << "\n";
+    }
 };
 
 //===----------------------------------------------------------------------===//
@@ -185,6 +219,7 @@ struct BenchmarkConfig {
     int operations_per_thread = 0;  // 0 = time-based, >0 = operation-based
 
     bool verbose = false;
+    bool json_output = false;
 
     std::string ConnectionString() const {
         return "host=" + host +

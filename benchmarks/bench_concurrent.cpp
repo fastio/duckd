@@ -145,6 +145,8 @@ int main(int argc, char* argv[]) {
             config.keep_alive = false;
         } else if (arg == "-v" || arg == "--verbose") {
             config.verbose = true;
+        } else if (arg == "--json") {
+            config.json_output = true;
         } else if (arg == "--help") {
             std::cout << "Concurrent Connections Benchmark\n"
                       << "Usage: " << argv[0] << " [options]\n"
@@ -160,6 +162,7 @@ int main(int argc, char* argv[]) {
                       << "  --queries-per-conn N    Queries before reconnect (default: 100)\n"
                       << "  --no-keep-alive         Disconnect after queries-per-conn\n"
                       << "  -v, --verbose           Verbose output\n"
+                      << "  --json                  Output results as JSON\n"
                       << "  --help                  Show this help\n";
             return 0;
         }
@@ -249,9 +252,12 @@ int main(int argc, char* argv[]) {
     result.failed_operations = failed_ops.load();
     result.total_time = end_time - start_time;
 
-    result.Print();
-
-    std::cout << "Peak Active Connections: ~" << config.num_threads << "\n";
+    if (config.json_output) {
+        result.PrintJson();
+    } else {
+        result.Print();
+        std::cout << "Peak Active Connections: ~" << config.num_threads << "\n";
+    }
 
     return result.failed_operations > 0 ? 1 : 0;
 }

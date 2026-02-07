@@ -130,6 +130,8 @@ int main(int argc, char* argv[]) {
             config.params_per_query = std::stoi(argv[++i]);
         } else if (arg == "-v" || arg == "--verbose") {
             config.verbose = true;
+        } else if (arg == "--json") {
+            config.json_output = true;
         } else if (arg == "--help") {
             std::cout << "Prepared Statement Benchmark\n"
                       << "Usage: " << argv[0] << " [options]\n"
@@ -144,6 +146,7 @@ int main(int argc, char* argv[]) {
                       << "  -s, --statements N     Prepared statements per connection (default: 10)\n"
                       << "  --params N             Parameters per query (default: 3)\n"
                       << "  -v, --verbose          Verbose output\n"
+                      << "  --json                 Output results as JSON\n"
                       << "  --help                 Show this help\n";
             return 0;
         }
@@ -203,7 +206,11 @@ int main(int argc, char* argv[]) {
     result.failed_operations = failed_ops.load();
     result.total_time = end_time - start_time;
 
-    result.Print();
+    if (config.json_output) {
+        result.PrintJson();
+    } else {
+        result.Print();
+    }
 
     return result.failed_operations > 0 ? 1 : 0;
 }
