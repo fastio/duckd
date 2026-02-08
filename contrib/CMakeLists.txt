@@ -62,3 +62,22 @@ add_subdirectory(duckdb)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     set(CMAKE_CXX_FLAGS "${DUCKD_SAVED_CXX_FLAGS}")
 endif()
+
+# Arrow Flight SQL (optional, for high-performance columnar data transfer)
+if(WITH_FLIGHT_SQL)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/arrow/cpp/CMakeLists.txt")
+        message(FATAL_ERROR "Arrow submodule not initialized. Run: git submodule update --init --recursive")
+    endif()
+
+    # Suppress warnings from Arrow and its bundled dependencies
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        set(DUCKD_SAVED_CXX_FLAGS_ARROW "${CMAKE_CXX_FLAGS}")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
+    endif()
+
+    add_subdirectory(arrow-cmake)
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        set(CMAKE_CXX_FLAGS "${DUCKD_SAVED_CXX_FLAGS_ARROW}")
+    endif()
+endif()

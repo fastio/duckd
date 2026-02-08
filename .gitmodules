@@ -13,3 +13,6 @@
 [submodule "/Users/jian/Codes/duckd/contrib/parallel-hashmap"]
 	path = /Users/jian/Codes/duckd/contrib/parallel-hashmap
 	url = https://github.com/greg7mdp/parallel-hashmap.git
+[submodule "contrib/arrow"]
+	path = contrib/arrow
+	url = https://github.com/apache/arrow.git

@@ -32,11 +32,18 @@
 #include <systemd/sd-daemon.h>
 #endif
 
+#ifdef DUCKD_WITH_FLIGHT_SQL
+#include "protocol/flight/flight_sql_server.hpp"
+#endif
+
 using namespace duckdb_server;
 
 // Global state
 static std::shared_ptr<TcpServer> g_server;
 static std::shared_ptr<HttpServer> g_http_server;
+#ifdef DUCKD_WITH_FLIGHT_SQL
+static std::unique_ptr<DuckDBFlightSqlServer> g_flight_server;
+#endif
 static std::atomic<bool> g_shutdown_requested{false};
 static std::atomic<bool> g_reload_requested{false};
 static std::string g_pid_file;
@@ -250,6 +257,11 @@ void SignalHandler(int signal) {
     if (signal == SIGINT || signal == SIGTERM) {
         LOG_INFO("main", "Shutdown signal received");
         g_shutdown_requested = true;
+#ifdef DUCKD_WITH_FLIGHT_SQL
+        if (g_flight_server) {
+            g_flight_server->Shutdown();
+        }
+#endif
         if (g_server) {
             g_server->Stop();
         }
@@ -365,6 +377,11 @@ int main(int argc, char* argv[]) {
         if (g_config.http_port > 0) {
             LOG_INFO("main", "  HTTP Port: " + std::to_string(g_config.http_port));
         }
+#ifdef DUCKD_WITH_FLIGHT_SQL
+        if (g_config.flight_port > 0) {
+            LOG_INFO("main", "  Flight SQL Port: " + std::to_string(g_config.flight_port));
+        }
+#endif
 
         // Create DuckDB instance
         LOG_INFO("main", "Opening database: " + g_config.database_path);
@@ -447,6 +464,29 @@ int main(int argc, char* argv[]) {
             g_http_server->Start();
         }
 
+#ifdef DUCKD_WITH_FLIGHT_SQL
+        // Start Arrow Flight SQL server
+        if (g_config.flight_port > 0) {
+            g_flight_server = std::make_unique<DuckDBFlightSqlServer>(
+                session_manager.get(), executor_pool.get(),
+                g_config.host, g_config.flight_port);
+
+            auto flight_status = g_flight_server->Init();
+            if (!flight_status.ok()) {
+                LOG_ERROR("main", "Failed to init Flight SQL server: " + flight_status.ToString());
+                return 1;
+            }
+
+            auto serve_status = g_flight_server->ServeAsync();
+            if (!serve_status.ok()) {
+                LOG_ERROR("main", "Failed to start Flight SQL server: " + serve_status.ToString());
+                return 1;
+            }
+
+            LOG_INFO("main", "Flight SQL server started on " + g_config.host + ":" + std::to_string(g_config.flight_port));
+        }
+#endif
+
         LOG_INFO("main", "DuckD Server is ready to accept connections");
 
         // Notify systemd
@@ -466,6 +506,13 @@ int main(int argc, char* argv[]) {
 
         // Cleanup
         LOG_INFO("main", "Shutting down...");
+
+#ifdef DUCKD_WITH_FLIGHT_SQL
+        if (g_flight_server) {
+            g_flight_server->Shutdown();
+            g_flight_server.reset();
+        }
+#endif
 
         if (g_http_server) {
             g_http_server->Stop();

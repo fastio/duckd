@@ -10,6 +10,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 option(WITH_SYSTEMD "Enable systemd integration" OFF)
+option(WITH_FLIGHT_SQL "Enable Arrow Flight SQL protocol" OFF)
 
 # Get git commit hash
 execute_process(

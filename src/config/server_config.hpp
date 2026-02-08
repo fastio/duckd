@@ -23,6 +23,7 @@ struct ServerConfig {
     std::string host = "0.0.0.0";
     uint16_t port = 5432;  // Default to PostgreSQL port
     uint16_t http_port = 0;  // 0 = disabled, for health/metrics
+    uint16_t flight_port = 0;  // 0 = disabled, Arrow Flight SQL
 
     // Database
     std::string database_path = ":memory:";
@@ -109,6 +110,7 @@ struct ServerConfig {
         if (cfg.Has("host")) host = cfg.GetString("host");
         if (cfg.Has("port")) port = static_cast<uint16_t>(cfg.GetInt("port"));
         if (cfg.Has("http_port")) http_port = static_cast<uint16_t>(cfg.GetInt("http_port"));
+        if (cfg.Has("flight_port")) flight_port = static_cast<uint16_t>(cfg.GetInt("flight_port"));
         if (cfg.Has("database")) database_path = cfg.GetString("database");
         if (cfg.Has("log_file")) log_file = cfg.GetString("log_file");
         if (cfg.Has("log_level")) log_level = cfg.GetString("log_level");
@@ -143,6 +145,7 @@ struct ServerConfig {
         if (cfg.Has("server.host")) host = cfg.GetString("server.host");
         if (cfg.Has("server.port")) port = static_cast<uint16_t>(cfg.GetInt("server.port"));
         if (cfg.Has("server.http_port")) http_port = static_cast<uint16_t>(cfg.GetInt("server.http_port"));
+        if (cfg.Has("server.flight_port")) flight_port = static_cast<uint16_t>(cfg.GetInt("server.flight_port"));
 
         // Database section
         if (cfg.Has("database.path")) database_path = cfg.GetString("database.path");
@@ -194,6 +197,7 @@ inline void PrintUsage(const char* program) {
               << "  --executor-threads <n>  Executor thread count (default: auto)\n"
               << "  --max-connections <n>   Max connections (default: 100)\n"
               << "  --http-port <port>      HTTP port for health/metrics (default: disabled)\n"
+              << "  --flight-port <port>    Arrow Flight SQL port (default: disabled)\n"
               << "  --max-memory <bytes>    Max memory limit (default: unlimited)\n"
               << "  --max-open-files <n>    Max open file descriptors\n"
               << "  --query-timeout <ms>    Query timeout in milliseconds (default: 300000)\n"
@@ -262,6 +266,8 @@ inline ServerConfig ParseCommandLine(int argc, char* argv[], bool& show_version)
             config.max_connections = static_cast<uint32_t>(std::stoi(argv[++i]));
         } else if (arg == "--http-port" && i + 1 < argc) {
             config.http_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        } else if (arg == "--flight-port" && i + 1 < argc) {
+            config.flight_port = static_cast<uint16_t>(std::stoi(argv[++i]));
         } else if (arg == "--max-memory" && i + 1 < argc) {
             config.max_memory = static_cast<uint64_t>(std::stoll(argv[++i]));
         } else if (arg == "--max-open-files" && i + 1 < argc) {

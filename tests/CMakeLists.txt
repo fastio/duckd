@@ -149,6 +149,39 @@ add_custom_target(test_pg
 )
 
 #===----------------------------------------------------------------------===//
+# Integration Tests - Arrow Flight SQL (conditional)
+#===----------------------------------------------------------------------===//
+
+if(WITH_FLIGHT_SQL)
+    add_executable(test_flight_sql
+        ${CMAKE_SOURCE_DIR}/tests/integration/flight/test_flight_sql.cpp
+    )
+    target_include_directories(test_flight_sql
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${DUCKDB_INCLUDE_DIRS}
+            ${CMAKE_SOURCE_DIR}/contrib/arrow/cpp/src
+            ${CMAKE_BINARY_DIR}/contrib/arrow-cmake/arrow/src
+    )
+    target_link_libraries(test_flight_sql
+        PRIVATE
+            ${DUCKD_TEST_LIBS}
+            arrow_flight_sql_static
+            arrow_flight_static
+            arrow_static
+            "${ARROW_BUNDLED_DEPS_LIB}"
+    )
+    target_compile_features(test_flight_sql PUBLIC cxx_std_17)
+    add_test(NAME test_flight_sql COMMAND test_flight_sql)
+
+    add_custom_target(test_flight
+        COMMAND ${CMAKE_CTEST_COMMAND} -R "test_flight" --output-on-failure
+        DEPENDS test_flight_sql
+        COMMENT "Running Flight SQL tests"
+    )
+endif()
+
+#===----------------------------------------------------------------------===//
 # Custom test target: run logging tests
 #===----------------------------------------------------------------------===//
 
