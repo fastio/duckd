@@ -129,10 +129,6 @@ ProcessResult PgHandler::ProcessBufferLoop() {
     return ProcessResult::CONTINUE;
 }
 
-bool PgHandler::CanReleaseConnection() const {
-    return !in_transaction && prepared_statements.empty();
-}
-
 // Zero-allocation case-insensitive prefix match (skips leading whitespace)
 static bool SqlStartsWithCI(const char* sql, size_t len, const char* keyword) {
     size_t i = 0;
@@ -151,28 +147,6 @@ static bool SqlContainsCI(const char* sql, size_t len, size_t start, const char*
         if (strncasecmp(sql + i, keyword, klen) == 0) return true;
     }
     return false;
-}
-
-void PgHandler::RevalidatePreparedStatements(duckdb::Connection& conn) {
-    for (auto& [name, info] : prepared_statements) {
-        try {
-            auto prepared = conn.Prepare(info.query);
-            if (!prepared->HasError()) {
-                info.statement = std::move(prepared);
-                info.column_names.clear();
-                info.column_types.clear();
-                for (idx_t i = 0; i < info.statement->ColumnCount(); i++) {
-                    info.column_names.push_back(info.statement->GetNames()[i]);
-                    info.column_types.push_back(info.statement->GetTypes()[i]);
-                }
-            } else {
-                LOG_WARN("pg", "Failed to revalidate prepared statement '" + name + "': " + prepared->GetError());
-            }
-        } catch (const std::exception& e) {
-            LOG_WARN("pg", "Exception revalidating prepared statement '" + name + "': " + e.what());
-        }
-    }
-    last_connection = &conn;
 }
 
 bool PgHandler::HandleStartup(const uint8_t* data, size_t len) {
@@ -381,10 +355,6 @@ void PgHandler::HandleQuery(const uint8_t* data, size_t len) {
             buf.insert(buf.end(), rfq.begin(), rfq.end());
 
             send_cb(std::move(buf));
-
-            if (CanReleaseConnection() && sess->HasActiveConnection()) {
-                sess->ReleaseConnection();
-            }
         });
     });
 }
@@ -488,13 +458,11 @@ void PgHandler::HandleParse(const uint8_t* data, size_t len) {
                 info.column_types.push_back(info.statement->GetTypes()[i]);
             }
 
-            duckdb::Connection* conn_ptr = &conn;
             writer.WriteParseComplete();
 
-            resume_cb([this, stmt_name, info = std::move(info), conn_ptr, send_cb,
+            resume_cb([this, stmt_name, info = std::move(info), send_cb,
                        buf = writer.TakeBuffer()]() mutable {
                 prepared_statements[stmt_name] = std::move(info);
-                last_connection = conn_ptr;
                 send_cb(std::move(buf));
             });
 
@@ -649,39 +617,26 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
     auto send_cb = send_callback;
     auto resume_cb = resume_callback;
 
-    executor_pool->Submit([this, params = std::move(params), max_rows, query, stmt_name = portal.statement_name,
+    executor_pool->Submit([this, params = std::move(params), max_rows, query,
                             statement, sess, send_cb, resume_cb]() {
         PgMessageWriter writer;
-        duckdb::Connection* conn_ptr = nullptr;
-        bool needs_revalidation = false;
         sess->MarkQueryStart();
 
         try {
-            auto& conn = sess->GetConnection();
-            conn_ptr = &conn;
-            needs_revalidation = (last_connection != nullptr && last_connection != &conn);
-
-            auto exec_stmt = statement;
-
             // Execute the prepared statement with bound parameters
             std::unique_ptr<duckdb::QueryResult> result;
             if (params.empty()) {
-                result = exec_stmt->Execute();
+                result = statement->Execute();
             } else {
                 duckdb::vector<duckdb::Value> duckdb_params(params.begin(), params.end());
-                auto pending = exec_stmt->PendingQuery(duckdb_params, true);
+                auto pending = statement->PendingQuery(duckdb_params, true);
                 result = pending->Execute();
             }
 
             if (result->HasError()) {
                 writer.WriteErrorResponse("ERROR", "42000", result->GetError());
                 sess->MarkQueryEnd();
-                resume_cb([this, conn_ptr, needs_revalidation, send_cb,
-                           buf = writer.TakeBuffer()]() mutable {
-                    if (needs_revalidation) {
-                        RevalidatePreparedStatements(*conn_ptr);
-                    }
-                    last_connection = conn_ptr;
+                resume_cb([this, send_cb, buf = writer.TakeBuffer()]() mutable {
                     if (in_transaction) {
                         transaction_failed = true;
                     }
@@ -731,26 +686,14 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
             }
 
             sess->MarkQueryEnd();
-            resume_cb([this, conn_ptr, needs_revalidation, send_cb,
-                       buf = writer.TakeBuffer()]() mutable {
-                if (needs_revalidation) {
-                    RevalidatePreparedStatements(*conn_ptr);
-                }
-                last_connection = conn_ptr;
+            resume_cb([this, send_cb, buf = writer.TakeBuffer()]() mutable {
                 send_cb(std::move(buf));
             });
 
         } catch (const std::exception& e) {
             writer.WriteErrorResponse("ERROR", "XX000", e.what());
             sess->MarkQueryEnd();
-            resume_cb([this, conn_ptr, needs_revalidation, send_cb,
-                       buf = writer.TakeBuffer()]() mutable {
-                if (needs_revalidation && conn_ptr) {
-                    RevalidatePreparedStatements(*conn_ptr);
-                }
-                if (conn_ptr) {
-                    last_connection = conn_ptr;
-                }
+            resume_cb([this, send_cb, buf = writer.TakeBuffer()]() mutable {
                 if (in_transaction) {
                     transaction_failed = true;
                 }
@@ -778,22 +721,12 @@ void PgHandler::HandleClose(const uint8_t* data, size_t len) {
     writer.Clear();
     writer.WriteCloseComplete();
     send_callback(writer.TakeBuffer());
-
-    // Try to release connection after deallocating a prepared statement
-    if (msg.close_type == 'S' && CanReleaseConnection() && session->HasActiveConnection()) {
-        session->ReleaseConnection();
-    }
 }
 
 void PgHandler::HandleSync(const uint8_t* data, size_t len) {
     (void)data;
     (void)len;
     SendReadyForQuery();
-
-    // Try to release connection after sync if possible
-    if (CanReleaseConnection() && session->HasActiveConnection()) {
-        session->ReleaseConnection();
-    }
 }
 
 void PgHandler::HandleFlush(const uint8_t* data, size_t len) {

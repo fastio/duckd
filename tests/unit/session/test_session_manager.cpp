@@ -3,7 +3,7 @@
 //
 // tests/unit/session/test_session_manager.cpp
 //
-// Unit tests for SessionManager
+// Unit tests for SessionManager (sticky session model)
 //===----------------------------------------------------------------------===//
 
 #include "session/session_manager.hpp"
@@ -59,8 +59,6 @@ void TestSessionManagerCustomConfig() {
     auto db = CreateDB();
     SessionManager::Config config;
     config.max_sessions = 50;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 10;
 
     SessionManager mgr(db, config);
 
@@ -79,8 +77,6 @@ void TestCreateSession() {
     auto db = CreateDB();
     SessionManager::Config config;
     config.max_sessions = 100;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 20;
 
     SessionManager mgr(db, config);
 
@@ -99,8 +95,6 @@ void TestCreateMultipleSessions() {
     auto db = CreateDB();
     SessionManager::Config config;
     config.max_sessions = 100;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 20;
 
     SessionManager mgr(db, config);
 
@@ -130,8 +124,6 @@ void TestCreateSessionMaxLimit() {
     auto db = CreateDB();
     SessionManager::Config config;
     config.max_sessions = 3;
-    config.pool_min_connections = 1;
-    config.pool_max_connections = 5;
 
     SessionManager mgr(db, config);
 
@@ -160,12 +152,7 @@ void TestGetSession() {
     std::cout << "  Testing GetSession..." << std::endl;
 
     auto db = CreateDB();
-    SessionManager::Config config;
-    config.max_sessions = 100;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 20;
-
-    SessionManager mgr(db, config);
+    SessionManager mgr(db);
 
     auto session = mgr.CreateSession();
     uint64_t id = session->GetSessionId();
@@ -189,12 +176,7 @@ void TestRemoveSession() {
     std::cout << "  Testing RemoveSession..." << std::endl;
 
     auto db = CreateDB();
-    SessionManager::Config config;
-    config.max_sessions = 100;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 20;
-
-    SessionManager mgr(db, config);
+    SessionManager mgr(db);
 
     auto session = mgr.CreateSession();
     uint64_t id = session->GetSessionId();
@@ -225,12 +207,7 @@ void TestCancelQuery() {
     std::cout << "  Testing CancelQuery..." << std::endl;
 
     auto db = CreateDB();
-    SessionManager::Config config;
-    config.max_sessions = 100;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 20;
-
-    SessionManager mgr(db, config);
+    SessionManager mgr(db);
 
     auto session = mgr.CreateSession();
     session->SetBackendKeyData(100, 200);
@@ -254,53 +231,25 @@ void TestCancelQuery() {
 }
 
 //===----------------------------------------------------------------------===//
-// Pool Stats Tests
-//===----------------------------------------------------------------------===//
-
-void TestPoolStats() {
-    std::cout << "  Testing GetPoolStats..." << std::endl;
-
-    auto db = CreateDB();
-    SessionManager::Config config;
-    config.max_sessions = 100;
-    config.pool_min_connections = 3;
-    config.pool_max_connections = 20;
-
-    SessionManager mgr(db, config);
-
-    auto stats = mgr.GetPoolStats();
-    assert(stats.current_size >= 3);
-    assert(stats.total_created >= 3);
-
-    std::cout << "    PASSED" << std::endl;
-}
-
-//===----------------------------------------------------------------------===//
 // Session with Connection Tests
 //===----------------------------------------------------------------------===//
 
-void TestSessionUsesPool() {
-    std::cout << "  Testing session uses connection pool..." << std::endl;
+void TestSessionUsesConnection() {
+    std::cout << "  Testing session uses sticky connection..." << std::endl;
 
     auto db = CreateDB();
-    SessionManager::Config config;
-    config.max_sessions = 100;
-    config.pool_min_connections = 2;
-    config.pool_max_connections = 20;
-
-    SessionManager mgr(db, config);
+    SessionManager mgr(db);
 
     auto session = mgr.CreateSession();
-    assert(session->HasConnection());
-
-    // Lazy connection - not acquired yet
-    assert(!session->HasActiveConnection());
 
     // Use connection
     auto& conn = session->GetConnection();
     auto result = conn.Query("SELECT 42 AS answer");
     assert(!result->HasError());
-    assert(session->HasActiveConnection());
+
+    // Same connection returned on second call
+    auto& conn2 = session->GetConnection();
+    assert(&conn == &conn2);
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -315,8 +264,6 @@ void TestConcurrentSessionCreation() {
     auto db = CreateDB();
     SessionManager::Config config;
     config.max_sessions = 10000;
-    config.pool_min_connections = 5;
-    config.pool_max_connections = 50;
 
     SessionManager mgr(db, config);
 
@@ -370,13 +317,10 @@ int main() {
     std::cout << "\n5. Cancel Query:" << std::endl;
     TestCancelQuery();
 
-    std::cout << "\n6. Pool Stats:" << std::endl;
-    TestPoolStats();
+    std::cout << "\n6. Session with Connection:" << std::endl;
+    TestSessionUsesConnection();
 
-    std::cout << "\n7. Session with Pool:" << std::endl;
-    TestSessionUsesPool();
-
-    std::cout << "\n8. Concurrent Access:" << std::endl;
+    std::cout << "\n7. Concurrent Access:" << std::endl;
     TestConcurrentSessionCreation();
 
     std::cout << "\n=== All tests PASSED ===" << std::endl;

@@ -3,11 +3,10 @@
 //
 // tests/unit/session/test_session.cpp
 //
-// Unit tests for Session
+// Unit tests for Session (sticky session model)
 //===----------------------------------------------------------------------===//
 
 #include "session/session.hpp"
-#include "session/connection_pool.hpp"
 #include "duckdb.hpp"
 #include <cassert>
 #include <iostream>
@@ -25,46 +24,24 @@ static std::shared_ptr<duckdb::DuckDB> CreateDB() {
 }
 
 //===----------------------------------------------------------------------===//
-// Legacy Constructor Tests
+// Construction Tests
 //===----------------------------------------------------------------------===//
 
-void TestSessionLegacyConstruction() {
-    std::cout << "  Testing legacy construction (owned connection)..." << std::endl;
+void TestSessionConstruction() {
+    std::cout << "  Testing construction..." << std::endl;
 
     auto db = CreateDB();
     Session session(1, db->instance);
 
     assert(session.GetSessionId() == 1);
-    assert(session.HasConnection());
-    assert(!session.HasActiveConnection());  // Not yet acquired
 
-    // GetConnection should return owned connection
+    // Connection is not yet created (lazy)
     auto& conn = session.GetConnection();
     (void)conn;
-    assert(session.HasActiveConnection());
 
-    std::cout << "    PASSED" << std::endl;
-}
-
-void TestSessionPoolConstruction() {
-    std::cout << "  Testing pool construction (lazy acquisition)..." << std::endl;
-
-    auto db = CreateDB();
-    ConnectionPool::Config config;
-    config.min_connections = 2;
-    config.max_connections = 5;
-    ConnectionPool pool(db->instance, config);
-
-    Session session(42, &pool);
-
-    assert(session.GetSessionId() == 42);
-    assert(session.HasConnection());          // Has pool pointer
-    assert(!session.HasActiveConnection());   // Not yet acquired
-
-    // Lazy acquisition on first GetConnection
-    auto& conn = session.GetConnection();
-    (void)conn;
-    assert(session.HasActiveConnection());
+    // Connection is now live - verify it works
+    auto result = conn.Query("SELECT 42");
+    assert(!result->HasError());
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -120,79 +97,48 @@ void TestSessionBackendKeyData() {
 }
 
 //===----------------------------------------------------------------------===//
-// Prepared Statement Tests
+// Sticky Connection Tests
 //===----------------------------------------------------------------------===//
 
-void TestPreparedStatements() {
-    std::cout << "  Testing prepared statements..." << std::endl;
+void TestStickyConnection() {
+    std::cout << "  Testing sticky connection (same connection across calls)..." << std::endl;
 
     auto db = CreateDB();
     Session session(1, db->instance);
 
-    // Initially none
-    assert(session.GetPreparedStatement("stmt1") == nullptr);
+    // First GetConnection creates it
+    auto& conn1 = session.GetConnection();
+    // Second GetConnection returns the same object
+    auto& conn2 = session.GetConnection();
 
-    // Prepare a statement
-    auto& conn = session.GetConnection();
-    auto stmt = conn.Prepare("SELECT $1::INTEGER AS val");
-    assert(!stmt->HasError());
+    assert(&conn1 == &conn2);
 
-    session.AddPreparedStatement("stmt1", std::move(stmt));
-
-    // Get it back
-    auto* retrieved = session.GetPreparedStatement("stmt1");
-    assert(retrieved != nullptr);
-
-    // Non-existent
-    assert(session.GetPreparedStatement("nonexistent") == nullptr);
+    // Verify the connection works
+    auto result = conn1.Query("SELECT 1 AS n");
+    assert(!result->HasError());
 
     std::cout << "    PASSED" << std::endl;
 }
 
-void TestRemovePreparedStatement() {
-    std::cout << "  Testing RemovePreparedStatement..." << std::endl;
+void TestConnectionPersistsAcrossQueries() {
+    std::cout << "  Testing connection persists (session state)..." << std::endl;
 
     auto db = CreateDB();
     Session session(1, db->instance);
 
     auto& conn = session.GetConnection();
-    auto stmt = conn.Prepare("SELECT 1");
-    session.AddPreparedStatement("stmt1", std::move(stmt));
 
-    assert(session.GetPreparedStatement("stmt1") != nullptr);
+    // Create a temp table
+    auto r1 = conn.Query("CREATE TEMP TABLE t(x INTEGER)");
+    assert(!r1->HasError());
 
-    // Remove
-    bool removed = session.RemovePreparedStatement("stmt1");
-    assert(removed);
-    assert(session.GetPreparedStatement("stmt1") == nullptr);
+    // Insert
+    auto r2 = conn.Query("INSERT INTO t VALUES (42)");
+    assert(!r2->HasError());
 
-    // Remove non-existent
-    removed = session.RemovePreparedStatement("nonexistent");
-    assert(!removed);
-
-    std::cout << "    PASSED" << std::endl;
-}
-
-void TestClearPreparedStatements() {
-    std::cout << "  Testing ClearPreparedStatements..." << std::endl;
-
-    auto db = CreateDB();
-    Session session(1, db->instance);
-
-    auto& conn = session.GetConnection();
-    session.AddPreparedStatement("s1", conn.Prepare("SELECT 1"));
-    session.AddPreparedStatement("s2", conn.Prepare("SELECT 2"));
-    session.AddPreparedStatement("s3", conn.Prepare("SELECT 3"));
-
-    assert(session.GetPreparedStatement("s1") != nullptr);
-    assert(session.GetPreparedStatement("s2") != nullptr);
-    assert(session.GetPreparedStatement("s3") != nullptr);
-
-    session.ClearPreparedStatements();
-
-    assert(session.GetPreparedStatement("s1") == nullptr);
-    assert(session.GetPreparedStatement("s2") == nullptr);
-    assert(session.GetPreparedStatement("s3") == nullptr);
+    // Query still works on same connection
+    auto r3 = conn.Query("SELECT x FROM t");
+    assert(!r3->HasError());
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -239,10 +185,14 @@ void TestInterruptQuery() {
     auto db = CreateDB();
     Session session(1, db->instance);
 
-    // Ensure connection exists
-    session.GetConnection();
+    // Interrupt before connection is created (should not crash)
+    session.InterruptQuery();
+    assert(session.IsCancelRequested());
 
-    // Should not crash
+    session.ClearCancel();
+
+    // Interrupt after connection is created
+    session.GetConnection();
     session.InterruptQuery();
     assert(session.IsCancelRequested());
 
@@ -288,42 +238,6 @@ void TestSessionTouch() {
 }
 
 //===----------------------------------------------------------------------===//
-// Connection Release Tests
-//===----------------------------------------------------------------------===//
-
-void TestSessionReleaseConnection() {
-    std::cout << "  Testing ReleaseConnection..." << std::endl;
-
-    auto db = CreateDB();
-    ConnectionPool::Config config;
-    config.min_connections = 2;
-    config.max_connections = 5;
-    ConnectionPool pool(db->instance, config);
-
-    Session session(1, &pool);
-
-    // Acquire
-    session.GetConnection();
-    assert(session.HasActiveConnection());
-
-    auto stats = pool.GetStats();
-    assert(stats.in_use == 1);
-
-    // Release
-    session.ReleaseConnection();
-    assert(!session.HasActiveConnection());
-
-    stats = pool.GetStats();
-    assert(stats.in_use == 0);
-
-    // Can re-acquire
-    session.GetConnection();
-    assert(session.HasActiveConnection());
-
-    std::cout << "    PASSED" << std::endl;
-}
-
-//===----------------------------------------------------------------------===//
 // Timestamp Tests
 //===----------------------------------------------------------------------===//
 
@@ -350,18 +264,16 @@ void TestSessionTimestamps() {
 int main() {
     std::cout << "=== Session Unit Tests ===" << std::endl;
 
-    std::cout << "\n1. Construction Tests:" << std::endl;
-    TestSessionLegacyConstruction();
-    TestSessionPoolConstruction();
+    std::cout << "\n1. Construction:" << std::endl;
+    TestSessionConstruction();
 
     std::cout << "\n2. State Management:" << std::endl;
     TestSessionState();
     TestSessionBackendKeyData();
 
-    std::cout << "\n3. Prepared Statements:" << std::endl;
-    TestPreparedStatements();
-    TestRemovePreparedStatement();
-    TestClearPreparedStatements();
+    std::cout << "\n3. Sticky Connection:" << std::endl;
+    TestStickyConnection();
+    TestConnectionPersistsAcrossQueries();
 
     std::cout << "\n4. Query Tracking:" << std::endl;
     TestQueryTracking();
@@ -371,10 +283,7 @@ int main() {
     TestSessionExpiry();
     TestSessionTouch();
 
-    std::cout << "\n6. Connection Release:" << std::endl;
-    TestSessionReleaseConnection();
-
-    std::cout << "\n7. Timestamps:" << std::endl;
+    std::cout << "\n6. Timestamps:" << std::endl;
     TestSessionTimestamps();
 
     std::cout << "\n=== All tests PASSED ===" << std::endl;

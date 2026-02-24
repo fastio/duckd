@@ -142,7 +142,7 @@ private:
     // Prepared statement storage
     // NOTE: connection must be declared BEFORE statement so it is destroyed AFTER
     struct PreparedStatementEntry {
-        PooledConnection connection;
+        std::unique_ptr<duckdb::Connection> connection;
         std::unique_ptr<duckdb::PreparedStatement> statement;
         std::string query;
         std::shared_ptr<arrow::Schema> result_schema;

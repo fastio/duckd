@@ -3,14 +3,13 @@
 //
 // session/session_manager.hpp
 //
-// Session manager with connection pooling
+// Session manager - sticky session model
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "common.hpp"
 #include "session/session.hpp"
-#include "session/connection_pool.hpp"
 #include "duckdb.hpp"
 #include <parallel_hashmap/phmap.h>
 
@@ -19,25 +18,12 @@ namespace duckdb_server {
 class SessionManager {
 public:
     struct Config {
-        // Session settings
         size_t max_sessions;
         std::chrono::minutes session_timeout;
 
-        // Connection pool settings
-        size_t pool_min_connections;
-        size_t pool_max_connections;
-        std::chrono::seconds pool_idle_timeout;
-        std::chrono::milliseconds pool_acquire_timeout;
-        bool pool_validate_on_acquire;
-
         Config()
             : max_sessions(DEFAULT_MAX_CONNECTIONS)
-            , session_timeout(DEFAULT_SESSION_TIMEOUT_MINUTES)
-            , pool_min_connections(5)
-            , pool_max_connections(50)
-            , pool_idle_timeout(300)
-            , pool_acquire_timeout(5000)
-            , pool_validate_on_acquire(false) {}
+            , session_timeout(DEFAULT_SESSION_TIMEOUT_MINUTES) {}
     };
 
     explicit SessionManager(std::shared_ptr<duckdb::DuckDB> db_p,
@@ -72,17 +58,11 @@ public:
     size_t GetMaxSessions() const { return config.max_sessions; }
     uint64_t GetTotalSessionsCreated() const { return total_sessions_created; }
 
-    // Connection pool statistics
-    ConnectionPool::Stats GetPoolStats() const;
-
     // Cancel a running query by process_id and secret_key
     bool CancelQuery(int32_t process_id, int32_t secret_key);
 
     // Get DuckDB instance
     duckdb::DuckDB& GetDatabase() { return *db; }
-
-    // Get connection pool
-    ConnectionPool& GetConnectionPool() { return *connection_pool; }
 
 private:
     // Generate next session ID
@@ -94,9 +74,6 @@ private:
 private:
     // DuckDB instance
     std::shared_ptr<duckdb::DuckDB> db;
-
-    // Connection pool
-    std::unique_ptr<ConnectionPool> connection_pool;
 
     // Sessions - using parallel_flat_hash_map for high-concurrency access
     // The parallel version internally shards the map and uses fine-grained locking

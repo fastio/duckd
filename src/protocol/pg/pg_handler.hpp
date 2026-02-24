@@ -94,8 +94,6 @@ public:
     // Check if in transaction
     bool InTransaction() const { return in_transaction; }
 
-    // Check if connection can be released (Step 2: lazy connection)
-    bool CanReleaseConnection() const;
 
 private:
     // Internal buffer processing loop (shared by ProcessData and ProcessPendingBuffer)
@@ -132,8 +130,6 @@ private:
     // Utility
     char GetTransactionStatus() const;
 
-    // Revalidate prepared statements after connection switch (Step 2)
-    void RevalidatePreparedStatements(duckdb::Connection& conn);
 
 private:
     std::shared_ptr<Session> session;
@@ -158,9 +154,6 @@ private:
     // Using phmap::flat_hash_map for better performance than std::unordered_map
     phmap::flat_hash_map<std::string, PreparedStatementInfo> prepared_statements;
     phmap::flat_hash_map<std::string, PortalInfo> portals;
-
-    // Track last connection pointer for revalidation (Step 2)
-    duckdb::Connection* last_connection = nullptr;
 
     // Buffer for incomplete messages
     std::vector<uint8_t> buffer;

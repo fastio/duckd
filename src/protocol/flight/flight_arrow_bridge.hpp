@@ -12,7 +12,6 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/main/client_properties.hpp"
 #include "duckdb/main/client_context.hpp"
-#include "session/connection_pool.hpp"
 
 #include <arrow/api.h>
 #include <arrow/c/bridge.h>
@@ -111,11 +110,11 @@ public:
         , schema_(std::move(schema))
         , props_(std::move(props)) {}
 
-    // Constructor that also holds a pooled connection alive
+    // Constructor that also holds a connection alive for streaming results
     DuckDBRecordBatchReader(
         std::unique_ptr<duckdb::QueryResult> result,
         std::shared_ptr<arrow::Schema> schema,
-        PooledConnection connection)
+        std::unique_ptr<duckdb::Connection> connection)
         : result_(std::move(result))
         , schema_(std::move(schema))
         , connection_(std::move(connection))
@@ -143,7 +142,7 @@ public:
 private:
     std::unique_ptr<duckdb::QueryResult> result_;
     std::shared_ptr<arrow::Schema> schema_;
-    PooledConnection connection_;  // keeps connection alive for streaming results
+    std::unique_ptr<duckdb::Connection> connection_;  // keeps connection alive for streaming results
     duckdb::ClientProperties props_;
 };
 

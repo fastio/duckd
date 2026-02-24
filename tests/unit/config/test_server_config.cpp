@@ -57,11 +57,6 @@ void TestDefaultValues() {
     assert(config.max_memory == 0);
     assert(config.max_open_files == 0);
     assert(config.query_timeout_ms == 300000);
-    assert(config.pool_min_connections == 5);
-    assert(config.pool_max_connections == 50);
-    assert(config.pool_idle_timeout_seconds == 300);
-    assert(config.pool_acquire_timeout_ms == 5000);
-    assert(config.pool_validate_on_acquire == false);
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -138,8 +133,6 @@ void TestLoadFromIni() {
         "max_connections = 200\n"
         "io_threads = 4\n"
         "executor_threads = 8\n"
-        "pool_min_connections = 10\n"
-        "pool_max_connections = 100\n"
         "query_timeout_ms = 60000\n"
         "daemon = true\n";
 
@@ -157,8 +150,6 @@ void TestLoadFromIni() {
     assert(config.max_connections == 200);
     assert(config.io_threads == 4);
     assert(config.executor_threads == 8);
-    assert(config.pool_min_connections == 10);
-    assert(config.pool_max_connections == 100);
     assert(config.query_timeout_ms == 60000);
     assert(config.daemon == true);
 
@@ -246,14 +237,7 @@ void TestLoadFromYaml() {
         "limits:\n"
         "  max_connections: 500\n"
         "  query_timeout_ms: 120000\n"
-        "  session_timeout_minutes: 60\n"
-        "\n"
-        "pool:\n"
-        "  min: 8\n"
-        "  max: 200\n"
-        "  idle_timeout_seconds: 600\n"
-        "  acquire_timeout_ms: 10000\n"
-        "  validate_on_acquire: true\n";
+        "  session_timeout_minutes: 60\n";
 
     auto path = WriteTempFile(content, ".yaml");
 
@@ -274,11 +258,6 @@ void TestLoadFromYaml() {
     assert(config.max_connections == 500);
     assert(config.query_timeout_ms == 120000);
     assert(config.session_timeout_minutes == 60);
-    assert(config.pool_min_connections == 8);
-    assert(config.pool_max_connections == 200);
-    assert(config.pool_idle_timeout_seconds == 600);
-    assert(config.pool_acquire_timeout_ms == 10000);
-    assert(config.pool_validate_on_acquire == true);
 
     CleanupFile(path);
     std::cout << "    PASSED" << std::endl;
@@ -371,9 +350,6 @@ void TestParseCommandLine() {
         "--http-port", "8080",
         "--flight-port", "8815",
         "--query-timeout", "60000",
-        "--pool-min", "10",
-        "--pool-max", "100",
-        "--pool-idle-timeout", "600",
         "--daemon"
     };
     int argc = sizeof(argv) / sizeof(argv[0]);
@@ -392,9 +368,6 @@ void TestParseCommandLine() {
     assert(config.http_port == 8080);
     assert(config.flight_port == 8815);
     assert(config.query_timeout_ms == 60000);
-    assert(config.pool_min_connections == 10);
-    assert(config.pool_max_connections == 100);
-    assert(config.pool_idle_timeout_seconds == 600);
     assert(config.daemon == true);
 
     std::cout << "    PASSED" << std::endl;

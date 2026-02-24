@@ -3,15 +3,13 @@
 //
 // session/session.hpp
 //
-// Session management
+// Session management - sticky session model
 //===----------------------------------------------------------------------===//
 
 #pragma once
 
 #include "common.hpp"
-#include "session/connection_pool.hpp"
 #include "duckdb.hpp"
-#include <parallel_hashmap/phmap.h>
 
 namespace duckdb_server {
 
@@ -19,13 +17,7 @@ class Session {
 public:
     using Ptr = std::shared_ptr<Session>;
 
-    // Constructor with connection pool (lazy acquisition)
-    Session(uint64_t session_id_p, ConnectionPool* pool_p);
-
-    // Legacy constructor (creates own connection, for backward compatibility)
-    Session(uint64_t session_id_p,
-            duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance_p);
-
+    Session(uint64_t session_id_p, duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance_p);
     ~Session();
 
     // Non-copyable
@@ -37,17 +29,8 @@ public:
     TimePoint GetCreatedAt() const { return created_at; }
     TimePoint GetLastActive() const { return last_active; }
 
-    // Get the underlying connection (acquires from pool on demand)
+    // Get the underlying connection (created lazily, held for session lifetime)
     duckdb::Connection& GetConnection();
-
-    // Release connection back to pool (only if not in transaction)
-    void ReleaseConnection();
-
-    // Check if session currently holds an active connection
-    bool HasActiveConnection() const;
-
-    // Check if session has any valid connection source
-    bool HasConnection() const;
 
     // State
     const std::string& GetCurrentDatabase() const { return current_database; }
@@ -55,13 +38,6 @@ public:
 
     const std::string& GetCurrentSchema() const { return current_schema; }
     void SetCurrentSchema(const std::string& schema) { current_schema = schema; }
-
-    // Prepared statements
-    void AddPreparedStatement(const std::string& name,
-                              std::unique_ptr<duckdb::PreparedStatement> stmt);
-    duckdb::PreparedStatement* GetPreparedStatement(const std::string& name);
-    bool RemovePreparedStatement(const std::string& name);
-    void ClearPreparedStatements();
 
     // Query tracking
     uint64_t GetCurrentQueryId() const { return current_query_id; }
@@ -109,12 +85,11 @@ private:
     TimePoint created_at;
     TimePoint last_active;
 
-    // Connection pool (for lazy acquisition)
-    ConnectionPool* pool = nullptr;
+    // DuckDB database instance (used to create connection on demand)
+    duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance;
 
-    // DuckDB connection - lazily acquired from pool or owned
-    PooledConnection active_connection;
-    std::unique_ptr<duckdb::Connection> owned_connection;  // Legacy fallback
+    // DuckDB connection - created lazily, held for session lifetime
+    std::unique_ptr<duckdb::Connection> connection;
 
     // Session state
     std::string current_database;
@@ -123,11 +98,6 @@ private:
     std::string username;
     int32_t backend_process_id = 0;
     int32_t backend_secret_key = 0;
-
-    // Prepared statements
-    // Using phmap::flat_hash_map for better performance than std::unordered_map
-    phmap::flat_hash_map<std::string, std::unique_ptr<duckdb::PreparedStatement>> prepared_statements;
-    std::mutex prepared_mutex;
 
     // Current query tracking
     std::atomic<uint64_t> current_query_id;

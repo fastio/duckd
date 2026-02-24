@@ -3,7 +3,7 @@
 //
 // session/session_manager.cpp
 //
-// Session manager implementation with connection pooling
+// Session manager implementation - sticky session model
 //===----------------------------------------------------------------------===//
 
 #include "session/session_manager.hpp"
@@ -35,16 +35,6 @@ SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db_p,
     , total_sessions_created(0)
     , cleanup_running(false) {
 
-    // Create connection pool
-    ConnectionPool::Config pool_config;
-    pool_config.min_connections = config_p.pool_min_connections;
-    pool_config.max_connections = config_p.pool_max_connections;
-    pool_config.idle_timeout = config_p.pool_idle_timeout;
-    pool_config.acquire_timeout = config_p.pool_acquire_timeout;
-    pool_config.validate_on_acquire = config_p.pool_validate_on_acquire;
-
-    connection_pool = std::make_unique<ConnectionPool>(db->instance, pool_config);
-
     // Setup DuckDB logging integration
     SetupDuckDBLogging(*db->instance);
 
@@ -67,20 +57,13 @@ SessionManager::SessionManager(std::shared_ptr<duckdb::DuckDB> db_p,
     config.max_sessions = max_sessions;
     config.session_timeout = session_timeout;
 
-    // Create connection pool with defaults based on max_sessions
-    ConnectionPool::Config pool_config;
-    pool_config.min_connections = std::min(size_t(5), max_sessions / 4 + 1);
-    pool_config.max_connections = max_sessions;
-
-    connection_pool = std::make_unique<ConnectionPool>(db->instance, pool_config);
-
     // Setup DuckDB logging integration
     SetupDuckDBLogging(*db->instance);
 
     // Start cleanup thread
     StartCleanupTimer();
 
-    LOG_INFO("session_manager", "Session manager initialized (legacy mode, max_sessions=" +
+    LOG_INFO("session_manager", "Session manager initialized (max_sessions=" +
              std::to_string(max_sessions) + ")");
 }
 
@@ -91,10 +74,9 @@ SessionManager::~SessionManager() {
         cleanup_thread.join();
     }
 
-    // Clear all sessions (will return connections to pool)
+    // Clear all sessions (connections destroyed with session)
     sessions.clear();
 
-    // Connection pool will be destroyed after sessions
     LOG_INFO("session_manager", "Session manager shutdown");
 }
 
@@ -109,8 +91,8 @@ SessionPtr SessionManager::CreateSession() {
     // Generate session ID
     uint64_t session_id = NextSessionId();
 
-    // Create session with pool pointer (lazy connection acquisition)
-    auto session = std::make_shared<Session>(session_id, connection_pool.get());
+    // Create session with db instance (lazy connection creation)
+    auto session = std::make_shared<Session>(session_id, db->instance);
 
     // Store using thread-safe insertion
     sessions.insert({session_id, session});
@@ -149,7 +131,6 @@ size_t SessionManager::CleanupExpiredSessions() {
     std::vector<uint64_t> expired;
 
     // First pass: collect expired session IDs
-    // Using for_each for thread-safe iteration
     sessions.for_each([this, &expired](const auto& item) {
         if (item.second->IsExpired(config.session_timeout)) {
             expired.push_back(item.first);
@@ -186,10 +167,6 @@ bool SessionManager::CancelQuery(int32_t process_id, int32_t secret_key) {
 
 size_t SessionManager::GetActiveSessionCount() const {
     return sessions.size();
-}
-
-ConnectionPool::Stats SessionManager::GetPoolStats() const {
-    return connection_pool->GetStats();
 }
 
 uint64_t SessionManager::NextSessionId() {

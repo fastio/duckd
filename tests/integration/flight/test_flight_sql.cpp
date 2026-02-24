@@ -37,8 +37,6 @@ public:
 
         SessionManager::Config sm_config;
         sm_config.max_sessions = 100;
-        sm_config.pool_min_connections = 2;
-        sm_config.pool_max_connections = 10;
         session_manager_ = std::make_shared<SessionManager>(db_, sm_config);
 
         executor_pool_ = std::make_shared<ExecutorPool>(2);

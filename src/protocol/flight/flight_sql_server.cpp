@@ -94,11 +94,7 @@ std::string DuckDBFlightSqlServer::GenerateHandle() {
 
 arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>
 DuckDBFlightSqlServer::ExecuteQuery(const std::string& query) {
-    auto& pool = session_manager_->GetConnectionPool();
-    auto conn = pool.Acquire();
-    if (!conn) {
-        return arrow::Status::ExecutionError("Failed to acquire connection from pool");
-    }
+    auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
 
     auto result = conn->Query(query);
     if (result->HasError()) {
@@ -121,11 +117,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatchReader>>
 DuckDBFlightSqlServer::ExecuteParameterizedQuery(
     const std::string& query,
     duckdb::vector<duckdb::Value>& params) {
-    auto& pool = session_manager_->GetConnectionPool();
-    auto conn = pool.Acquire();
-    if (!conn) {
-        return arrow::Status::ExecutionError("Failed to acquire connection from pool");
-    }
+    auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
 
     auto prepared = conn->Prepare(query);
     if (prepared->HasError()) {
@@ -195,11 +187,7 @@ DuckDBFlightSqlServer::GetFlightInfoStatement(
     const auto& query = command.query;
 
     // Prepare the query to get schema without executing
-    auto& pool = session_manager_->GetConnectionPool();
-    auto conn = pool.Acquire();
-    if (!conn) {
-        return arrow::Status::ExecutionError("Failed to acquire connection from pool");
-    }
+    auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
     auto prepared = conn->Prepare(query);
     if (prepared->HasError()) {
         return arrow::Status::ExecutionError(prepared->GetError());
@@ -255,12 +243,8 @@ DuckDBFlightSqlServer::DoGetStatement(
         return DoGetPreparedStatement(context, ps_command);
     }
 
-    // Execute the query using a pooled connection
-    auto& pool = session_manager_->GetConnectionPool();
-    auto conn = pool.Acquire();
-    if (!conn) {
-        return arrow::Status::ExecutionError("Failed to acquire connection from pool");
-    }
+    // Execute the query using a direct connection
+    auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
     auto result = conn->Query(query);
 
     if (result->HasError()) {
@@ -283,11 +267,7 @@ DuckDBFlightSqlServer::CreatePreparedStatement(
 
     const auto& query = request.query;
 
-    auto& pool = session_manager_->GetConnectionPool();
-    auto conn = pool.Acquire();
-    if (!conn) {
-        return arrow::Status::ExecutionError("Failed to acquire connection from pool");
-    }
+    auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
 
     auto prepared = conn->Prepare(query);
     if (prepared->HasError()) {

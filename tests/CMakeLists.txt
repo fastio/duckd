@@ -104,19 +104,6 @@ add_test(NAME test_executor_pool COMMAND test_executor_pool)
 # Unit Tests - Session Layer
 #===----------------------------------------------------------------------===//
 
-# Test: connection_pool (connection pooling)
-add_executable(test_connection_pool
-    ${CMAKE_SOURCE_DIR}/tests/unit/session/test_connection_pool.cpp
-)
-target_include_directories(test_connection_pool
-    PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${DUCKDB_INCLUDE_DIRS}
-)
-target_link_libraries(test_connection_pool PRIVATE ${DUCKD_TEST_LIBS})
-target_compile_features(test_connection_pool PUBLIC cxx_std_17)
-add_test(NAME test_connection_pool COMMAND test_connection_pool)
-
 # Test: session (session management)
 add_executable(test_session
     ${CMAKE_SOURCE_DIR}/tests/unit/session/test_session.cpp
@@ -273,9 +260,8 @@ add_custom_target(test_logging
 #===----------------------------------------------------------------------===//
 
 add_custom_target(test_session_layer
-    COMMAND ${CMAKE_CTEST_COMMAND} -R "test_(connection_pool|session)" --output-on-failure
+    COMMAND ${CMAKE_CTEST_COMMAND} -R "test_session" --output-on-failure
     DEPENDS
-        test_connection_pool
         test_session
         test_session_manager
     COMMENT "Running session layer tests"
