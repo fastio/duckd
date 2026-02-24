@@ -43,11 +43,14 @@ public:
         // Create handler with send callback, executor pool, and resume callback
         handler_ = std::make_unique<PgHandler>(
             session_,
-            [this](const std::vector<uint8_t>& data) {
+            [this](std::vector<uint8_t> data) {
                 received_data_.insert(received_data_.end(), data.begin(), data.end());
             },
             executor_pool_,
-            [this]() {
+            [this](PgHandler::StateUpdate state_update) {
+                if (state_update) {
+                    state_update();
+                }
                 async_complete_.store(true);
             }
         );
@@ -80,17 +83,17 @@ public:
     // Process data and handle async results; returns true if connection should continue
     bool ProcessAndWait(const std::vector<uint8_t>& buf) {
         auto result = handler_->ProcessData(buf.data(), buf.size());
-        if (result == ProcessResult::AsyncPending) {
+        if (result == ProcessResult::ASYNC_PENDING) {
             WaitForAsync();
             // Process any remaining buffer
             auto pending_result = handler_->ProcessPendingBuffer();
-            if (pending_result == ProcessResult::AsyncPending) {
+            if (pending_result == ProcessResult::ASYNC_PENDING) {
                 WaitForAsync();
                 pending_result = handler_->ProcessPendingBuffer();
             }
-            return pending_result != ProcessResult::Close;
+            return pending_result != ProcessResult::CLOSE;
         }
-        return result != ProcessResult::Close;
+        return result != ProcessResult::CLOSE;
     }
 
     // Send startup message
@@ -247,6 +250,16 @@ public:
         return ProcessAndWait(buf);
     }
 
+    // Send a raw message with arbitrary type (for error handling tests)
+    bool SendRawMessage(char type, const std::vector<uint8_t>& body = {}) {
+        std::vector<uint8_t> buf;
+        buf.push_back(static_cast<uint8_t>(type));
+        int32_t length = static_cast<int32_t>(4 + body.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), body.begin(), body.end());
+        return ProcessAndWait(buf);
+    }
+
     // Check if received data contains message type
     bool HasMessageType(char type) const {
         for (size_t i = 0; i < received_data_.size(); ) {
@@ -364,7 +377,7 @@ void TestStartupHandshake() {
     assert(test.HasMessageType('K'));  // BackendKeyData
     assert(test.HasMessageType('Z'));  // ReadyForQuery
     assert(test.GetReadyForQueryStatus() == 'I');  // Idle
-    assert(test.GetState() == PgConnectionState::Ready);
+    assert(test.GetState() == PgConnectionState::READY);
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -377,7 +390,7 @@ void TestTerminateConnection() {
     test.ClearReceived();
 
     assert(!test.SendTerminate());  // Returns false to close connection
-    assert(test.GetState() == PgConnectionState::Closed);
+    assert(test.GetState() == PgConnectionState::CLOSED);
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -814,7 +827,7 @@ void TestSQLSyntaxError() {
 
     assert(test.HasMessageType('E'));
     assert(test.HasMessageType('Z'));
-    assert(test.GetState() == PgConnectionState::Ready);  // Should remain usable
+    assert(test.GetState() == PgConnectionState::READY);  // Should remain usable
 
     std::cout << "    PASSED" << std::endl;
 }
@@ -871,6 +884,252 @@ void TestSQLColumnNotFound() {
 }
 
 //===----------------------------------------------------------------------===//
+// Transaction Tests
+//===----------------------------------------------------------------------===//
+
+void TestTransactionBeginCommit() {
+    std::cout << "  Testing Transaction BEGIN/COMMIT..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    // BEGIN
+    test.ClearReceived();
+    assert(test.SendQuery("BEGIN"));
+    assert(test.GetCommandCompleteTag() == "BEGIN");
+    assert(test.GetReadyForQueryStatus() == 'T');  // InTransaction
+
+    // Query within transaction
+    test.ClearReceived();
+    assert(test.SendQuery("SELECT 42"));
+    assert(test.GetReadyForQueryStatus() == 'T');  // Still in transaction
+
+    // COMMIT
+    test.ClearReceived();
+    assert(test.SendQuery("COMMIT"));
+    assert(test.GetCommandCompleteTag() == "COMMIT");
+    assert(test.GetReadyForQueryStatus() == 'I');  // Back to idle
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestTransactionBeginRollback() {
+    std::cout << "  Testing Transaction BEGIN/ROLLBACK..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    // BEGIN
+    test.ClearReceived();
+    assert(test.SendQuery("BEGIN"));
+    assert(test.GetReadyForQueryStatus() == 'T');
+
+    // Create a table in the transaction
+    test.ClearReceived();
+    test.SendQuery("CREATE TABLE rollback_test (id INTEGER)");
+    assert(test.GetReadyForQueryStatus() == 'T');
+
+    // ROLLBACK
+    test.ClearReceived();
+    assert(test.SendQuery("ROLLBACK"));
+    assert(test.GetCommandCompleteTag() == "ROLLBACK");
+    assert(test.GetReadyForQueryStatus() == 'I');
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestTransactionFailedQuery() {
+    std::cout << "  Testing Transaction failed query state (E status)..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    // BEGIN
+    test.ClearReceived();
+    assert(test.SendQuery("BEGIN"));
+    assert(test.GetReadyForQueryStatus() == 'T');
+
+    // Query that fails inside transaction
+    test.ClearReceived();
+    assert(test.SendQuery("SELECT * FROM no_such_table_xyz_abc"));
+    assert(test.HasMessageType('E'));                    // ErrorResponse
+    assert(test.GetReadyForQueryStatus() == 'E');        // Failed transaction state
+
+    // ROLLBACK to recover
+    test.ClearReceived();
+    assert(test.SendQuery("ROLLBACK"));
+    assert(test.GetReadyForQueryStatus() == 'I');        // Back to idle
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Command Tag Tests
+//===----------------------------------------------------------------------===//
+
+void TestCommandTagDropTable() {
+    std::cout << "  Testing Command Tag DROP TABLE..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.SendQuery("CREATE TABLE drop_target (id INTEGER)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("DROP TABLE drop_target"));
+    assert(test.GetCommandCompleteTag() == "DROP TABLE");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCommandTagCreateView() {
+    std::cout << "  Testing Command Tag CREATE VIEW..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    assert(test.SendQuery("CREATE VIEW view_tag_test AS SELECT 1 AS id"));
+    assert(test.GetCommandCompleteTag() == "CREATE VIEW");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCommandTagCreateIndex() {
+    std::cout << "  Testing Command Tag CREATE INDEX..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.SendQuery("CREATE TABLE idx_table (id INTEGER, name VARCHAR)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("CREATE INDEX idx_on_id ON idx_table (id)"));
+    assert(test.GetCommandCompleteTag() == "CREATE INDEX");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCommandTagAlterTable() {
+    std::cout << "  Testing Command Tag ALTER TABLE..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.SendQuery("CREATE TABLE alter_target (id INTEGER)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("ALTER TABLE alter_target ADD COLUMN name VARCHAR"));
+    assert(test.GetCommandCompleteTag() == "ALTER TABLE");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Portal Describe and Close Tests
+//===----------------------------------------------------------------------===//
+
+void TestDescribePortal() {
+    std::cout << "  Testing Describe Portal (type='P')..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    // Parse a statement with result columns
+    test.SendParse("dp_stmt", "SELECT 1 AS num, 'hello' AS str");
+    test.ClearReceived();
+
+    // Bind to a portal
+    test.SendBind("dp_portal", "dp_stmt");
+    assert(test.HasMessageType('2'));  // BindComplete
+    test.ClearReceived();
+
+    // Describe the portal
+    assert(test.SendDescribe('P', "dp_portal"));
+    // Portal Describe returns RowDescription (no ParameterDescription for portals)
+    assert(test.HasMessageType('T'));  // RowDescription
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestClosePortal() {
+    std::cout << "  Testing Close Portal (type='P')..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    test.SendParse("cp_stmt", "SELECT 42");
+    test.ClearReceived();
+
+    test.SendBind("cp_portal", "cp_stmt");
+    assert(test.HasMessageType('2'));  // BindComplete
+    test.ClearReceived();
+
+    // Close the portal (not the statement)
+    assert(test.SendClose('P', "cp_portal"));
+    assert(test.HasMessageType('3'));  // CloseComplete
+
+    // Statement should still exist - we can bind again
+    test.ClearReceived();
+    test.SendBind("cp_portal2", "cp_stmt");
+    assert(test.HasMessageType('2'));  // BindComplete
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Execute Max Rows (Portal Suspension) Tests
+//===----------------------------------------------------------------------===//
+
+void TestExecuteMaxRows() {
+    std::cout << "  Testing Execute max_rows (PortalSuspended)..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.SendQuery("CREATE TABLE maxrows_src (id INTEGER)");
+    test.SendQuery("INSERT INTO maxrows_src VALUES (1),(2),(3),(4),(5)");
+    test.ClearReceived();
+
+    test.SendParse("mr_stmt", "SELECT id FROM maxrows_src ORDER BY id");
+    test.ClearReceived();
+
+    test.SendBind("mr_portal", "mr_stmt");
+    assert(test.HasMessageType('2'));  // BindComplete
+    test.ClearReceived();
+
+    // Execute with max_rows=2 → should get 2 DataRows + PortalSuspended
+    assert(test.SendExecute("mr_portal", 2));
+    assert(test.CountDataRows() == 2);
+    assert(test.HasMessageType('s'));  // PortalSuspended
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
+// Unknown Message Type Tests
+//===----------------------------------------------------------------------===//
+
+void TestUnknownMessageType() {
+    std::cout << "  Testing Unknown Message Type..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+    test.ClearReceived();
+
+    // Send message with unknown type '?' (no body)
+    assert(test.SendRawMessage('?'));
+    assert(test.HasMessageType('E'));  // ErrorResponse
+    assert(test.HasMessageType('Z'));  // ReadyForQuery (connection still alive)
+    assert(test.GetState() == PgConnectionState::READY);
+
+    // Verify connection is still usable
+    test.ClearReceived();
+    assert(test.SendQuery("SELECT 1"));
+    assert(test.HasMessageType('D'));  // DataRow
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -913,6 +1172,27 @@ int main() {
     TestSQLConstraintViolation();
     TestSQLTableNotFound();
     TestSQLColumnNotFound();
+
+    std::cout << "\n6. Transaction Tests:" << std::endl;
+    TestTransactionBeginCommit();
+    TestTransactionBeginRollback();
+    TestTransactionFailedQuery();
+
+    std::cout << "\n7. Command Tag Tests:" << std::endl;
+    TestCommandTagDropTable();
+    TestCommandTagCreateView();
+    TestCommandTagCreateIndex();
+    TestCommandTagAlterTable();
+
+    std::cout << "\n8. Portal Describe and Close:" << std::endl;
+    TestDescribePortal();
+    TestClosePortal();
+
+    std::cout << "\n9. Execute Max Rows:" << std::endl;
+    TestExecuteMaxRows();
+
+    std::cout << "\n10. Unknown Message Type:" << std::endl;
+    TestUnknownMessageType();
 
     std::cout << "\n=== All integration tests PASSED ===" << std::endl;
     return 0;
