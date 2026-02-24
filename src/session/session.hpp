@@ -20,11 +20,11 @@ public:
     using Ptr = std::shared_ptr<Session>;
 
     // Constructor with connection pool (lazy acquisition)
-    Session(uint64_t session_id, ConnectionPool* pool);
+    Session(uint64_t session_id_p, ConnectionPool* pool_p);
 
     // Legacy constructor (creates own connection, for backward compatibility)
-    Session(uint64_t session_id,
-            duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance);
+    Session(uint64_t session_id_p,
+            duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance_p);
 
     ~Session();
 
@@ -33,9 +33,9 @@ public:
     Session& operator=(const Session&) = delete;
 
     // Getters
-    uint64_t GetSessionId() const { return session_id_; }
-    TimePoint GetCreatedAt() const { return created_at_; }
-    TimePoint GetLastActive() const { return last_active_; }
+    uint64_t GetSessionId() const { return session_id; }
+    TimePoint GetCreatedAt() const { return created_at; }
+    TimePoint GetLastActive() const { return last_active; }
 
     // Get the underlying connection (acquires from pool on demand)
     duckdb::Connection& GetConnection();
@@ -50,11 +50,11 @@ public:
     bool HasConnection() const;
 
     // State
-    const std::string& GetCurrentDatabase() const { return current_database_; }
-    void SetCurrentDatabase(const std::string& db) { current_database_ = db; }
+    const std::string& GetCurrentDatabase() const { return current_database; }
+    void SetCurrentDatabase(const std::string& db) { current_database = db; }
 
-    const std::string& GetCurrentSchema() const { return current_schema_; }
-    void SetCurrentSchema(const std::string& schema) { current_schema_ = schema; }
+    const std::string& GetCurrentSchema() const { return current_schema; }
+    void SetCurrentSchema(const std::string& schema) { current_schema = schema; }
 
     // Prepared statements
     void AddPreparedStatement(const std::string& name,
@@ -64,55 +64,76 @@ public:
     void ClearPreparedStatements();
 
     // Query tracking
-    uint64_t GetCurrentQueryId() const { return current_query_id_; }
-    void SetCurrentQueryId(uint64_t id) { current_query_id_ = id; }
+    uint64_t GetCurrentQueryId() const { return current_query_id; }
+    void SetCurrentQueryId(uint64_t id) { current_query_id = id; }
 
-    bool IsCancelRequested() const { return cancel_requested_; }
-    void RequestCancel() { cancel_requested_ = true; }
-    void ClearCancel() { cancel_requested_ = false; }
+    bool IsCancelRequested() const { return cancel_requested; }
+    void RequestCancel() { cancel_requested = true; }
+    void ClearCancel() { cancel_requested = false; }
+
+    // Query timing
+    void MarkQueryStart() { query_start_time = Clock::now(); query_running.store(true, std::memory_order_release); }
+    void MarkQueryEnd() { query_running = false; }
+    bool IsQueryRunning() const { return query_running.load(std::memory_order_acquire); }
+    TimePoint GetQueryStartTime() const { return query_start_time; }
+
+    // Interrupt the running query
+    void InterruptQuery();
 
     // Update activity timestamp
-    void Touch() { last_active_ = Clock::now(); }
+    void Touch() { last_active = Clock::now(); }
 
     // Check if session is expired
     bool IsExpired(std::chrono::minutes timeout) const;
 
-    // Client info
-    void SetClientInfo(const std::string& info) { client_info_ = info; }
-    const std::string& GetClientInfo() const { return client_info_; }
+    // Backend key data (for cancel requests)
+    void SetBackendKeyData(int32_t process_id_p, int32_t secret_key_p) {
+        backend_process_id = process_id_p;
+        backend_secret_key = secret_key_p;
+    }
+    int32_t GetBackendProcessId() const { return backend_process_id; }
+    int32_t GetBackendSecretKey() const { return backend_secret_key; }
 
-    void SetUsername(const std::string& user) { username_ = user; }
-    const std::string& GetUsername() const { return username_; }
+    // Client info
+    void SetClientInfo(const std::string& info) { client_info = info; }
+    const std::string& GetClientInfo() const { return client_info; }
+
+    void SetUsername(const std::string& user) { username = user; }
+    const std::string& GetUsername() const { return username; }
 
 private:
     // Session ID
-    uint64_t session_id_;
+    uint64_t session_id;
 
     // Timestamps
-    TimePoint created_at_;
-    TimePoint last_active_;
+    TimePoint created_at;
+    TimePoint last_active;
 
     // Connection pool (for lazy acquisition)
-    ConnectionPool* pool_ = nullptr;
+    ConnectionPool* pool = nullptr;
 
     // DuckDB connection - lazily acquired from pool or owned
-    PooledConnection active_connection_;
-    std::unique_ptr<duckdb::Connection> owned_connection_;  // Legacy fallback
+    PooledConnection active_connection;
+    std::unique_ptr<duckdb::Connection> owned_connection;  // Legacy fallback
 
     // Session state
-    std::string current_database_;
-    std::string current_schema_;
-    std::string client_info_;
-    std::string username_;
+    std::string current_database;
+    std::string current_schema;
+    std::string client_info;
+    std::string username;
+    int32_t backend_process_id = 0;
+    int32_t backend_secret_key = 0;
 
     // Prepared statements
     // Using phmap::flat_hash_map for better performance than std::unordered_map
-    phmap::flat_hash_map<std::string, std::unique_ptr<duckdb::PreparedStatement>> prepared_statements_;
-    std::mutex prepared_mutex_;
+    phmap::flat_hash_map<std::string, std::unique_ptr<duckdb::PreparedStatement>> prepared_statements;
+    std::mutex prepared_mutex;
 
     // Current query tracking
-    std::atomic<uint64_t> current_query_id_;
-    std::atomic<bool> cancel_requested_;
+    std::atomic<uint64_t> current_query_id;
+    std::atomic<bool> cancel_requested;
+    std::atomic<bool> query_running{false};
+    TimePoint query_start_time;
 };
 
 } // namespace duckdb_server

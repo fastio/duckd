@@ -23,6 +23,8 @@ namespace pg {
 //===----------------------------------------------------------------------===//
 struct StartupMessage {
     int32_t protocol_version;
+    int32_t cancel_pid = 0;
+    int32_t cancel_secret_key = 0;
     phmap::flat_hash_map<std::string, std::string> parameters;
 
     std::string GetParameter(const std::string& key, const std::string& default_val = "") const {
@@ -90,15 +92,15 @@ struct CloseMessage {
 //===----------------------------------------------------------------------===//
 class PgMessageReader {
 public:
-    PgMessageReader(const uint8_t* data, size_t len)
-        : data_(data), len_(len), pos_(0) {}
+    PgMessageReader(const uint8_t* data_p, size_t len_p)
+        : data(data_p), len(len_p), pos(0) {}
 
     bool HasRemaining(size_t bytes = 1) const {
-        return pos_ + bytes <= len_;
+        return pos + bytes <= len;
     }
 
     size_t Remaining() const {
-        return len_ - pos_;
+        return len - pos;
     }
 
     //===------------------------------------------------------------------===//
@@ -112,14 +114,22 @@ public:
 
         msg.protocol_version = ReadInt32();
 
-        // Check for SSL or Cancel request
-        if (msg.protocol_version == SSL_REQUEST_CODE ||
-            msg.protocol_version == CANCEL_REQUEST_CODE) {
+        // Check for SSL request
+        if (msg.protocol_version == SSL_REQUEST_CODE) {
+            return true;
+        }
+
+        // Check for Cancel request - parse pid and secret_key
+        if (msg.protocol_version == CANCEL_REQUEST_CODE) {
+            if (HasRemaining(8)) {
+                msg.cancel_pid = ReadInt32();
+                msg.cancel_secret_key = ReadInt32();
+            }
             return true;
         }
 
         // Read parameters
-        while (HasRemaining() && data_[pos_] != 0) {
+        while (HasRemaining() && data[pos] != 0) {
             std::string key = ReadString();
             if (!HasRemaining()) return false;
             std::string value = ReadString();
@@ -127,7 +137,7 @@ public:
         }
 
         if (HasRemaining()) {
-            pos_++;  // Skip final null byte
+            pos++;  // Skip final null byte
         }
 
         return true;
@@ -185,8 +195,8 @@ public:
                 msg.param_values.push_back(std::nullopt);  // NULL
             } else {
                 if (!HasRemaining(param_len)) return false;
-                std::vector<uint8_t> value(data_ + pos_, data_ + pos_ + param_len);
-                pos_ += param_len;
+                std::vector<uint8_t> value(data + pos, data + pos + param_len);
+                pos += param_len;
                 msg.param_values.push_back(std::move(value));
             }
         }
@@ -234,34 +244,34 @@ public:
 
 private:
     uint8_t ReadByte() {
-        return data_[pos_++];
+        return data[pos++];
     }
 
     int16_t ReadInt16() {
         int16_t value;
-        std::memcpy(&value, data_ + pos_, 2);
-        pos_ += 2;
+        std::memcpy(&value, data + pos, 2);
+        pos += 2;
         return NetworkToHost16(value);
     }
 
     int32_t ReadInt32() {
         int32_t value;
-        std::memcpy(&value, data_ + pos_, 4);
-        pos_ += 4;
+        std::memcpy(&value, data + pos, 4);
+        pos += 4;
         return NetworkToHost32(value);
     }
 
     std::string ReadString() {
-        const char* start = reinterpret_cast<const char*>(data_ + pos_);
-        size_t len = strnlen(start, len_ - pos_);
-        pos_ += len + 1;  // Include null terminator
-        return std::string(start, len);
+        const char* start = reinterpret_cast<const char*>(data + pos);
+        size_t slen = strnlen(start, len - pos);
+        pos += slen + 1;  // Include null terminator
+        return std::string(start, slen);
     }
 
 private:
-    const uint8_t* data_;
-    size_t len_;
-    size_t pos_;
+    const uint8_t* data;
+    size_t len;
+    size_t pos;
 };
 
 } // namespace pg

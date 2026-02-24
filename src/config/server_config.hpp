@@ -54,7 +54,7 @@ struct ServerConfig {
     uint32_t pool_max_connections = 50;
     uint32_t pool_idle_timeout_seconds = 300;
     uint32_t pool_acquire_timeout_ms = 5000;
-    bool pool_validate_on_acquire = true;
+    bool pool_validate_on_acquire = false;
 
     uint32_t GetIoThreadCount() const {
         if (io_threads == 0) {

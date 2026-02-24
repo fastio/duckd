@@ -18,9 +18,11 @@ ExecutorPool::ExecutorPool(size_t thread_count)
     
     // Determine thread count
     if (thread_count_ == 0) {
-        thread_count_ = std::thread::hardware_concurrency() * 2;
+        // Each executor thread submits work to DuckDB, which has its own internal
+        // thread pool. Over-subscribing with *2 causes excessive context switches.
+        thread_count_ = std::thread::hardware_concurrency();
         if (thread_count_ == 0) {
-            thread_count_ = 8;  // Default fallback
+            thread_count_ = 4;  // Default fallback
         }
     }
 }
@@ -52,69 +54,59 @@ void ExecutorPool::Stop() {
     if (!running_) {
         return;
     }
-    
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        stop_requested_ = true;
-    }
-    
-    condition_.notify_all();
-    
+
+    stop_requested_ = true;
+    wake_cv_.notify_all();
+
     for (auto& worker : workers_) {
         if (worker.joinable()) {
             worker.join();
         }
     }
-    
+
     workers_.clear();
     running_ = false;
-    
-    // Clear remaining tasks
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        while (!tasks_.empty()) {
-            tasks_.pop();
-        }
-    }
-    
+
+    // Drain remaining tasks
+    Task task;
+    while (tasks_.try_dequeue(task)) {}
+
     LOG_INFO("executor_pool", "Executor pool stopped");
 }
 
 void ExecutorPool::Submit(Task task) {
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (stop_requested_) {
-            return;
-        }
-        tasks_.push(std::move(task));
+    if (stop_requested_) {
+        return;
     }
-    condition_.notify_one();
+    tasks_.enqueue(std::move(task));
+    wake_cv_.notify_one();
 }
 
 size_t ExecutorPool::PendingTasks() const {
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    return tasks_.size();
+    return tasks_.size_approx();
 }
 
 void ExecutorPool::Worker() {
     while (true) {
         Task task;
-        
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            
-            condition_.wait(lock, [this]() {
-                return stop_requested_ || !tasks_.empty();
+
+        // Try to dequeue without locking first
+        if (!tasks_.try_dequeue(task)) {
+            // No task available, wait for notification
+            std::unique_lock<std::mutex> lock(wake_mutex_);
+            wake_cv_.wait(lock, [this]() {
+                return stop_requested_.load() || tasks_.size_approx() > 0;
             });
-            
-            if (stop_requested_ && tasks_.empty()) {
-                return;
+            lock.unlock();
+
+            // Always try to dequeue after waking up
+            if (!tasks_.try_dequeue(task)) {
+                // Spurious wake-up or another worker took the task
+                if (stop_requested_) return;
+                continue;
             }
-            
-            task = std::move(tasks_.front());
-            tasks_.pop();
         }
-        
+
         // Execute task
         try {
             task();

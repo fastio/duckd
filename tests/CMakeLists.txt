@@ -84,6 +84,83 @@ target_compile_features(test_pg_message_reader PUBLIC cxx_std_17)
 add_test(NAME test_pg_message_reader COMMAND test_pg_message_reader)
 
 #===----------------------------------------------------------------------===//
+# Unit Tests - Executor Pool
+#===----------------------------------------------------------------------===//
+
+# Test: executor_pool (async task pool)
+add_executable(test_executor_pool
+    ${CMAKE_SOURCE_DIR}/tests/unit/executor/test_executor_pool.cpp
+)
+target_include_directories(test_executor_pool
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${DUCKDB_INCLUDE_DIRS}
+)
+target_link_libraries(test_executor_pool PRIVATE ${DUCKD_TEST_LIBS})
+target_compile_features(test_executor_pool PUBLIC cxx_std_17)
+add_test(NAME test_executor_pool COMMAND test_executor_pool)
+
+#===----------------------------------------------------------------------===//
+# Unit Tests - Session Layer
+#===----------------------------------------------------------------------===//
+
+# Test: connection_pool (connection pooling)
+add_executable(test_connection_pool
+    ${CMAKE_SOURCE_DIR}/tests/unit/session/test_connection_pool.cpp
+)
+target_include_directories(test_connection_pool
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${DUCKDB_INCLUDE_DIRS}
+)
+target_link_libraries(test_connection_pool PRIVATE ${DUCKD_TEST_LIBS})
+target_compile_features(test_connection_pool PUBLIC cxx_std_17)
+add_test(NAME test_connection_pool COMMAND test_connection_pool)
+
+# Test: session (session management)
+add_executable(test_session
+    ${CMAKE_SOURCE_DIR}/tests/unit/session/test_session.cpp
+)
+target_include_directories(test_session
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${DUCKDB_INCLUDE_DIRS}
+)
+target_link_libraries(test_session PRIVATE ${DUCKD_TEST_LIBS})
+target_compile_features(test_session PUBLIC cxx_std_17)
+add_test(NAME test_session COMMAND test_session)
+
+# Test: session_manager (session lifecycle and pool integration)
+add_executable(test_session_manager
+    ${CMAKE_SOURCE_DIR}/tests/unit/session/test_session_manager.cpp
+)
+target_include_directories(test_session_manager
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${DUCKDB_INCLUDE_DIRS}
+)
+target_link_libraries(test_session_manager PRIVATE ${DUCKD_TEST_LIBS})
+target_compile_features(test_session_manager PUBLIC cxx_std_17)
+add_test(NAME test_session_manager COMMAND test_session_manager)
+
+#===----------------------------------------------------------------------===//
+# Unit Tests - Configuration
+#===----------------------------------------------------------------------===//
+
+# Test: server_config (config parsing and validation)
+add_executable(test_server_config
+    ${CMAKE_SOURCE_DIR}/tests/unit/config/test_server_config.cpp
+)
+target_include_directories(test_server_config
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${DUCKDB_INCLUDE_DIRS}
+)
+target_link_libraries(test_server_config PRIVATE ${DUCKD_TEST_LIBS})
+target_compile_features(test_server_config PUBLIC cxx_std_17)
+add_test(NAME test_server_config COMMAND test_server_config)
+
+#===----------------------------------------------------------------------===//
 # Integration Tests - PostgreSQL Protocol
 #===----------------------------------------------------------------------===//
 
@@ -189,4 +266,17 @@ add_custom_target(test_logging
     COMMAND ${CMAKE_CTEST_COMMAND} -R "test_logger" --output-on-failure
     DEPENDS test_logger
     COMMENT "Running logging tests"
+)
+
+#===----------------------------------------------------------------------===//
+# Custom test target: run session layer tests
+#===----------------------------------------------------------------------===//
+
+add_custom_target(test_session_layer
+    COMMAND ${CMAKE_CTEST_COMMAND} -R "test_(connection_pool|session)" --output-on-failure
+    DEPENDS
+        test_connection_pool
+        test_session
+        test_session_manager
+    COMMENT "Running session layer tests"
 )

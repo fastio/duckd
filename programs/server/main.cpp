@@ -45,7 +45,6 @@ static std::shared_ptr<HttpServer> g_http_server;
 static std::unique_ptr<DuckDBFlightSqlServer> g_flight_server;
 #endif
 static std::atomic<bool> g_shutdown_requested{false};
-static std::atomic<bool> g_reload_requested{false};
 static std::string g_pid_file;
 static ServerConfig g_config;
 
@@ -250,26 +249,6 @@ void CrashHandler(int signal) {
     raise(signal);
 }
 
-//===----------------------------------------------------------------------===//
-// Signal Handlers
-//===----------------------------------------------------------------------===//
-void SignalHandler(int signal) {
-    if (signal == SIGINT || signal == SIGTERM) {
-        LOG_INFO("main", "Shutdown signal received");
-        g_shutdown_requested = true;
-#ifdef DUCKD_WITH_FLIGHT_SQL
-        if (g_flight_server) {
-            g_flight_server->Shutdown();
-        }
-#endif
-        if (g_server) {
-            g_server->Stop();
-        }
-    } else if (signal == SIGHUP) {
-        LOG_INFO("main", "Reload signal received");
-        g_reload_requested = true;
-    }
-}
 
 void ReloadConfig() {
     if (g_config.config_file.empty()) {
@@ -354,10 +333,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Set up signal handlers
-        std::signal(SIGINT, SignalHandler);
-        std::signal(SIGTERM, SignalHandler);
-        std::signal(SIGHUP, SignalHandler);
+        // Block SIGINT/SIGTERM/SIGHUP so they are handled synchronously via
+        // sigwait() in the main loop. All threads created after this inherit
+        // the mask, which ensures signals are only delivered to the main thread.
+        sigset_t shutdown_mask;
+        sigemptyset(&shutdown_mask);
+        sigaddset(&shutdown_mask, SIGINT);
+        sigaddset(&shutdown_mask, SIGTERM);
+        sigaddset(&shutdown_mask, SIGHUP);
+        pthread_sigmask(SIG_BLOCK, &shutdown_mask, nullptr);
+
         std::signal(SIGPIPE, SIG_IGN);
 
         // Set up crash handlers
@@ -397,7 +382,8 @@ int main(int argc, char* argv[]) {
         sm_config.pool_acquire_timeout = std::chrono::milliseconds(g_config.pool_acquire_timeout_ms);
         sm_config.pool_validate_on_acquire = g_config.pool_validate_on_acquire;
 
-        auto session_manager = std::make_shared<SessionManager>(db, sm_config);
+        auto session_manager = std::make_shared<SessionManager>(
+            db, sm_config, std::chrono::milliseconds(g_config.query_timeout_ms));
 
         LOG_INFO("main", "  Connection Pool: min=" + std::to_string(g_config.pool_min_connections) +
                  ", max=" + std::to_string(g_config.pool_max_connections));
@@ -492,13 +478,28 @@ int main(int argc, char* argv[]) {
         // Notify systemd
         NotifySystemd("READY=1");
 
-        // Main loop
-        while (!g_shutdown_requested) {
-            if (g_reload_requested) {
-                g_reload_requested = false;
-                ReloadConfig();
+        // Main loop: wait for signals synchronously (zero CPU overhead)
+        {
+            int sig;
+            while (sigwait(&shutdown_mask, &sig) == 0) {
+                if (sig == SIGHUP) {
+                    LOG_INFO("main", "Reload signal received");
+                    ReloadConfig();
+                } else {
+                    // SIGINT or SIGTERM
+                    LOG_INFO("main", "Shutdown signal received");
+                    g_shutdown_requested = true;
+#ifdef DUCKD_WITH_FLIGHT_SQL
+                    if (g_flight_server) {
+                        g_flight_server->Shutdown();
+                    }
+#endif
+                    if (g_server) {
+                        g_server->Stop();
+                    }
+                    break;
+                }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         // Notify systemd we're stopping

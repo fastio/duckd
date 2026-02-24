@@ -9,7 +9,7 @@
 #pragma once
 
 #include "common.hpp"
-#include <queue>
+#include "duckdb/parallel/concurrentqueue.hpp"
 #include <future>
 
 namespace duckdb_server {
@@ -71,10 +71,11 @@ private:
     // Worker threads
     std::vector<std::thread> workers_;
     
-    // Task queue
-    std::queue<Task> tasks_;
-    mutable std::mutex queue_mutex_;
-    std::condition_variable condition_;
+    // Lock-free task queue (moodycamel::ConcurrentQueue)
+    duckdb_moodycamel::ConcurrentQueue<Task> tasks_;
+    // Mutex + condvar only used for worker thread sleep/wake
+    mutable std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
     
     // Running flag
     std::atomic<bool> running_;

@@ -11,7 +11,7 @@
 #include "common.hpp"
 #include "duckdb.hpp"
 #include <parallel_hashmap/phmap.h>
-#include <queue>
+#include <vector>
 #include <condition_variable>
 #include <atomic>
 #include <functional>
@@ -26,8 +26,8 @@ class ConnectionPool;
 
 class PooledConnection {
 public:
-    PooledConnection() : pool_(nullptr), connection_(nullptr) {}
-    PooledConnection(ConnectionPool* pool, duckdb::Connection* conn);
+    PooledConnection() : pool(nullptr), connection(nullptr) {}
+    PooledConnection(ConnectionPool* pool_p, duckdb::Connection* conn);
     ~PooledConnection();
 
     // Move only
@@ -37,19 +37,19 @@ public:
     PooledConnection& operator=(const PooledConnection&) = delete;
 
     // Access the connection
-    duckdb::Connection* Get() const { return connection_; }
-    duckdb::Connection* operator->() const { return connection_; }
-    duckdb::Connection& operator*() const { return *connection_; }
+    duckdb::Connection* Get() const { return connection; }
+    duckdb::Connection* operator->() const { return connection; }
+    duckdb::Connection& operator*() const { return *connection; }
 
     // Check if valid
-    explicit operator bool() const { return connection_ != nullptr; }
+    explicit operator bool() const { return connection != nullptr; }
 
     // Release back to pool manually (called automatically by destructor)
     void Release();
 
 private:
-    ConnectionPool* pool_;
-    duckdb::Connection* connection_;
+    ConnectionPool* pool;
+    duckdb::Connection* connection;
 };
 
 //===----------------------------------------------------------------------===//
@@ -70,7 +70,7 @@ public:
             , max_connections(50)
             , idle_timeout(300)
             , acquire_timeout(5000)
-            , validate_on_acquire(true) {}
+            , validate_on_acquire(false) {}
     };
 
     struct Stats {
@@ -84,8 +84,8 @@ public:
         size_t validation_failure_count = 0;
     };
 
-    explicit ConnectionPool(duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance,
-                           const Config& config = Config{});
+    explicit ConnectionPool(duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance_p,
+                           const Config& config_p = Config{});
     ~ConnectionPool();
 
     // Non-copyable
@@ -101,7 +101,7 @@ public:
     Stats GetStats() const;
 
     // Configuration
-    const Config& GetConfig() const { return config_; }
+    const Config& GetConfig() const { return config; }
 
     // Resize pool
     void SetMinConnections(size_t min_conn);
@@ -142,27 +142,29 @@ private:
     void EnsureMinConnections();
 
 private:
-    duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance_;
-    Config config_;
+    duckdb::shared_ptr<duckdb::DatabaseInstance> db_instance;
+    Config config;
 
     // Pool state
-    std::queue<std::unique_ptr<PoolEntry>> available_;
+    std::vector<std::unique_ptr<PoolEntry>> available;
     // Using phmap::flat_hash_map for better performance than std::unordered_map
     // (SwissTable-based implementation from Google Abseil)
-    phmap::flat_hash_map<duckdb::Connection*, std::unique_ptr<PoolEntry>> in_use_;
-    mutable std::mutex mutex_;
-    std::condition_variable available_cv_;
+    phmap::flat_hash_map<duckdb::Connection*, std::unique_ptr<PoolEntry>> in_use;
+    mutable std::mutex mutex;
+    std::condition_variable available_cv;
 
     // Statistics
-    mutable std::atomic<size_t> total_created_{0};
-    mutable std::atomic<size_t> total_destroyed_{0};
-    mutable std::atomic<size_t> acquire_count_{0};
-    mutable std::atomic<size_t> acquire_timeout_count_{0};
-    mutable std::atomic<size_t> validation_failure_count_{0};
+    mutable std::atomic<size_t> total_created{0};
+    mutable std::atomic<size_t> total_destroyed{0};
+    mutable std::atomic<size_t> acquire_count{0};
+    mutable std::atomic<size_t> acquire_timeout_count{0};
+    mutable std::atomic<size_t> validation_failure_count{0};
 
     // Maintenance thread
-    std::atomic<bool> running_{true};
-    std::thread maintenance_thread_;
+    std::atomic<bool> running{true};
+    std::thread maintenance_thread;
+    std::mutex maintenance_mutex;
+    std::condition_variable maintenance_cv;
 };
 
 } // namespace duckdb_server

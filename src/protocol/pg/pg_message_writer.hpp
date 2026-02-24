@@ -21,15 +21,19 @@ namespace pg {
 class PgMessageWriter {
 public:
     PgMessageWriter() {
-        buffer_.reserve(4096);
+        buffer.reserve(4096);
     }
 
     // Get the buffer
-    const std::vector<uint8_t>& GetBuffer() const { return buffer_; }
-    std::vector<uint8_t>&& TakeBuffer() { return std::move(buffer_); }
+    const std::vector<uint8_t>& GetBuffer() const { return buffer; }
+    std::vector<uint8_t> TakeBuffer() {
+        std::vector<uint8_t> out = std::move(buffer);
+        buffer.reserve(out.capacity());  // Preserve capacity for continued use
+        return out;
+    }
 
     // Clear the buffer
-    void Clear() { buffer_.clear(); }
+    void Clear() { buffer.clear(); }
 
     //===------------------------------------------------------------------===//
     // Authentication Messages
@@ -105,9 +109,9 @@ public:
             if (value.IsNull()) {
                 WriteInt32(-1);  // NULL
             } else {
-                FormatValueInto(value, format_buffer_);
-                WriteInt32(static_cast<int32_t>(format_buffer_.size()));
-                WriteRawBytes(format_buffer_.data(), format_buffer_.size());
+                FormatValueInto(value, format_buffer);
+                WriteInt32(static_cast<int32_t>(format_buffer.size()));
+                WriteRawBytes(format_buffer.data(), format_buffer.size());
             }
         }
         EndMessage();
@@ -124,9 +128,9 @@ public:
         WriteInt16(static_cast<int16_t>(col_count));
 
         for (idx_t col = 0; col < col_count; col++) {
-            if (FormatCellDirect(col_data[col], row_idx, types[col], format_buffer_)) {
-                WriteInt32(static_cast<int32_t>(format_buffer_.size()));
-                WriteRawBytes(format_buffer_.data(), format_buffer_.size());
+            if (FormatCellDirect(col_data[col], row_idx, types[col], format_buffer)) {
+                WriteInt32(static_cast<int32_t>(format_buffer.size()));
+                WriteRawBytes(format_buffer.data(), format_buffer.size());
             } else {
                 // FormatCellDirect returns false for NULL or unsupported types
                 auto idx = col_data[col].sel->get_index(row_idx);
@@ -135,9 +139,9 @@ public:
                 } else {
                     // Unsupported type: fall back to GetValue
                     auto value = chunk->GetValue(col, row_idx);
-                    FormatValueInto(value, format_buffer_);
-                    WriteInt32(static_cast<int32_t>(format_buffer_.size()));
-                    WriteRawBytes(format_buffer_.data(), format_buffer_.size());
+                    FormatValueInto(value, format_buffer);
+                    WriteInt32(static_cast<int32_t>(format_buffer.size()));
+                    WriteRawBytes(format_buffer.data(), format_buffer.size());
                 }
             }
         }
@@ -175,6 +179,11 @@ public:
 
     void WriteNoData() {
         StartMessage(BackendMessage::NoData);
+        EndMessage();
+    }
+
+    void WritePortalSuspended() {
+        StartMessage(BackendMessage::PortalSuspended);
         EndMessage();
     }
 
@@ -223,57 +232,57 @@ public:
 
 private:
     void StartMessage(char type) {
-        message_start_ = buffer_.size();
-        buffer_.push_back(static_cast<uint8_t>(type));
+        message_start = buffer.size();
+        buffer.push_back(static_cast<uint8_t>(type));
         // Reserve space for length (will be filled in EndMessage)
-        buffer_.resize(buffer_.size() + 4);
+        buffer.resize(buffer.size() + 4);
     }
 
     void EndMessage() {
         // Calculate and write message length (includes length field itself)
-        int32_t length = static_cast<int32_t>(buffer_.size() - message_start_ - 1);
+        int32_t length = static_cast<int32_t>(buffer.size() - message_start - 1);
         int32_t network_length = HostToNetwork32(length);
-        std::memcpy(buffer_.data() + message_start_ + 1, &network_length, 4);
+        std::memcpy(buffer.data() + message_start + 1, &network_length, 4);
     }
 
     void WriteByte(uint8_t value) {
-        buffer_.push_back(value);
+        buffer.push_back(value);
     }
 
     void WriteBytes(const uint8_t* data, size_t len) {
-        buffer_.insert(buffer_.end(), data, data + len);
+        buffer.insert(buffer.end(), data, data + len);
     }
 
     void WriteRawBytes(const char* data, size_t len) {
-        buffer_.insert(buffer_.end(), data, data + len);
+        buffer.insert(buffer.end(), data, data + len);
     }
 
     void WriteInt16(int16_t value) {
         int16_t network_value = HostToNetwork16(value);
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&network_value);
-        buffer_.insert(buffer_.end(), ptr, ptr + 2);
+        buffer.insert(buffer.end(), ptr, ptr + 2);
     }
 
     void WriteInt32(int32_t value) {
         int32_t network_value = HostToNetwork32(value);
         const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&network_value);
-        buffer_.insert(buffer_.end(), ptr, ptr + 4);
+        buffer.insert(buffer.end(), ptr, ptr + 4);
     }
 
     void WriteString(const std::string& str) {
-        buffer_.insert(buffer_.end(), str.begin(), str.end());
-        buffer_.push_back(0);  // Null terminator
+        buffer.insert(buffer.end(), str.begin(), str.end());
+        buffer.push_back(0);  // Null terminator
     }
 
     void WriteErrorField(char field_type, const std::string& value) {
-        buffer_.push_back(static_cast<uint8_t>(field_type));
+        buffer.push_back(static_cast<uint8_t>(field_type));
         WriteString(value);
     }
 
 private:
-    std::vector<uint8_t> buffer_;
-    size_t message_start_ = 0;
-    std::string format_buffer_;  // Reusable formatting buffer for WriteDataRow
+    std::vector<uint8_t> buffer;
+    size_t message_start = 0;
+    std::string format_buffer;  // Reusable formatting buffer for WriteDataRow
 };
 
 } // namespace pg

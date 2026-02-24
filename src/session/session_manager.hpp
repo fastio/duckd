@@ -37,14 +37,15 @@ public:
             , pool_max_connections(50)
             , pool_idle_timeout(300)
             , pool_acquire_timeout(5000)
-            , pool_validate_on_acquire(true) {}
+            , pool_validate_on_acquire(false) {}
     };
 
-    explicit SessionManager(std::shared_ptr<duckdb::DuckDB> db,
-                           const Config& config = Config{});
+    explicit SessionManager(std::shared_ptr<duckdb::DuckDB> db_p,
+                           const Config& config_p = Config{},
+                           std::chrono::milliseconds query_timeout_p = std::chrono::milliseconds(300000));
 
     // Legacy constructor for backward compatibility
-    explicit SessionManager(std::shared_ptr<duckdb::DuckDB> db,
+    explicit SessionManager(std::shared_ptr<duckdb::DuckDB> db_p,
                            size_t max_sessions,
                            std::chrono::minutes session_timeout = std::chrono::minutes(DEFAULT_SESSION_TIMEOUT_MINUTES));
 
@@ -68,17 +69,20 @@ public:
 
     // Get statistics
     size_t GetActiveSessionCount() const;
-    size_t GetMaxSessions() const { return config_.max_sessions; }
-    uint64_t GetTotalSessionsCreated() const { return total_sessions_created_; }
+    size_t GetMaxSessions() const { return config.max_sessions; }
+    uint64_t GetTotalSessionsCreated() const { return total_sessions_created; }
 
     // Connection pool statistics
     ConnectionPool::Stats GetPoolStats() const;
 
+    // Cancel a running query by process_id and secret_key
+    bool CancelQuery(int32_t process_id, int32_t secret_key);
+
     // Get DuckDB instance
-    duckdb::DuckDB& GetDatabase() { return *db_; }
+    duckdb::DuckDB& GetDatabase() { return *db; }
 
     // Get connection pool
-    ConnectionPool& GetConnectionPool() { return *connection_pool_; }
+    ConnectionPool& GetConnectionPool() { return *connection_pool; }
 
 private:
     // Generate next session ID
@@ -89,10 +93,10 @@ private:
 
 private:
     // DuckDB instance
-    std::shared_ptr<duckdb::DuckDB> db_;
+    std::shared_ptr<duckdb::DuckDB> db;
 
     // Connection pool
-    std::unique_ptr<ConnectionPool> connection_pool_;
+    std::unique_ptr<ConnectionPool> connection_pool;
 
     // Sessions - using parallel_flat_hash_map for high-concurrency access
     // The parallel version internally shards the map and uses fine-grained locking
@@ -104,20 +108,24 @@ private:
         phmap::priv::Allocator<phmap::priv::Pair<const uint64_t, SessionPtr>>,
         4,  // N=4 means 2^4=16 submaps for parallel access
         std::mutex
-    > sessions_;
+    > sessions;
 
     // Configuration
-    Config config_;
+    Config config;
+    std::chrono::milliseconds query_timeout;
 
     // Session ID generator
-    std::atomic<uint64_t> next_session_id_;
+    std::atomic<uint64_t> next_session_id;
 
     // Statistics
-    std::atomic<uint64_t> total_sessions_created_;
+    std::atomic<uint64_t> total_sessions_created;
 
     // Cleanup timer
-    std::atomic<bool> cleanup_running_;
-    std::thread cleanup_thread_;
+    std::atomic<bool> cleanup_running;
+    std::thread cleanup_thread;
+    std::mutex cleanup_mutex;
+    std::condition_variable cleanup_cv;
+    int cleanup_counter = 0;
 };
 
 } // namespace duckdb_server

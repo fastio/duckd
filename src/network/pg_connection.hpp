@@ -13,7 +13,7 @@
 #include <asio.hpp>
 #include <memory>
 #include <array>
-#include <deque>
+#include <vector>
 
 namespace duckdb_server {
 
@@ -25,10 +25,10 @@ class PgConnection : public std::enable_shared_from_this<PgConnection> {
 public:
     using Ptr = std::shared_ptr<PgConnection>;
 
-    static Ptr Create(asio::ip::tcp::socket socket,
-                      TcpServer* server,
-                      std::shared_ptr<Session> session,
-                      std::shared_ptr<ExecutorPool> executor_pool);
+    static Ptr Create(asio::ip::tcp::socket socket_p,
+                      TcpServer* server_p,
+                      std::shared_ptr<Session> session_p,
+                      std::shared_ptr<ExecutorPool> executor_pool_p);
 
     ~PgConnection();
 
@@ -43,30 +43,31 @@ public:
     uint16_t GetRemotePort() const;
 
 private:
-    PgConnection(asio::ip::tcp::socket socket,
-                 TcpServer* server,
-                 std::shared_ptr<Session> session,
-                 std::shared_ptr<ExecutorPool> executor_pool);
+    PgConnection(asio::ip::tcp::socket socket_p,
+                 TcpServer* server_p,
+                 std::shared_ptr<Session> session_p,
+                 std::shared_ptr<ExecutorPool> executor_pool_p);
 
     void DoRead();
     void DoWrite();
-    void Send(const std::vector<uint8_t>& data);
+    void Send(std::vector<uint8_t> data);
 
     // Resume message processing after async operation completes
     void ResumeAfterAsync();
 
 private:
-    asio::ip::tcp::socket socket_;
-    TcpServer* server_;
-    std::shared_ptr<Session> session_;
-    std::shared_ptr<ExecutorPool> executor_pool_;
-    std::unique_ptr<pg::PgHandler> handler_;
+    asio::ip::tcp::socket socket;
+    TcpServer* server;
+    std::shared_ptr<Session> session;
+    std::shared_ptr<ExecutorPool> executor_pool;
+    std::unique_ptr<pg::PgHandler> handler;
 
-    std::array<uint8_t, 8192> read_buffer_;
-    std::deque<std::vector<uint8_t>> write_queue_;
-    std::mutex write_mutex_;
-    bool writing_ = false;
-    bool closed_ = false;
+    std::array<uint8_t, 32768> read_buffer;
+    std::vector<std::vector<uint8_t>> write_queue;
+    std::vector<std::vector<uint8_t>> write_batch;  // Owned by DoWrite, holds data during async_write
+    std::mutex write_mutex;
+    bool writing = false;
+    bool closed = false;
 };
 
 } // namespace duckdb_server
