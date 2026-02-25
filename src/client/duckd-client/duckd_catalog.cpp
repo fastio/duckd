@@ -35,9 +35,12 @@
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/storage/database_size.hpp"
 
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+
 #include <arrow/api.h>
 #include <arrow/type.h>
 
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -173,6 +176,154 @@ static Value ArrowScalarToValue(const arrow::Array &arr, int64_t idx) {
 }
 
 //===----------------------------------------------------------------------===//
+// Utilities: Arrow column → DuckDB Vector (zero-copy for fixed-width types)
+//
+// Fills `count` values starting at `src_offset` in the Arrow array `src`
+// into the DuckDB output Vector `dst` (positions 0..count-1).
+//
+// For fixed-width numeric types the data buffer is memcpy'd directly.
+// For variable-width types (strings, blobs) we iterate and use
+// StringVector::AddString to intern each value into the DuckDB string heap.
+// Boolean is bitpacked in Arrow; we unpack it per-element.
+// All other types fall back to the row-by-row ArrowScalarToValue path.
+//===----------------------------------------------------------------------===//
+
+static void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
+                                 int64_t src_offset, idx_t count) {
+    auto &validity = FlatVector::Validity(dst);
+
+    // Mark null positions (validity mask starts all-valid on a fresh vector)
+    if (src.null_count() > 0) {
+        for (idx_t i = 0; i < count; i++) {
+            if (src.IsNull(src_offset + i)) {
+                validity.SetInvalid(i);
+            }
+        }
+    }
+
+    switch (src.type_id()) {
+
+    case arrow::Type::BOOL: {
+        auto &arr  = static_cast<const arrow::BooleanArray &>(src);
+        auto *data = FlatVector::GetData<uint8_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            data[i] = arr.Value(src_offset + i) ? 1 : 0;
+        }
+        break;
+    }
+
+    // Fixed-width integers — direct memcpy from Arrow data buffer
+#define DUCKD_FILL_FIXED(ArrowTy, CppTy, DuckTy)                                   \
+    case ArrowTy: {                                                                 \
+        const auto *sptr = src.data()->GetValues<CppTy>(1) + src_offset;          \
+        auto       *dptr = FlatVector::GetData<DuckTy>(dst);                       \
+        std::memcpy(dptr, sptr, count * sizeof(CppTy));                             \
+        break;                                                                     \
+    }
+
+    DUCKD_FILL_FIXED(arrow::Type::INT8,   int8_t,   int8_t)
+    DUCKD_FILL_FIXED(arrow::Type::INT16,  int16_t,  int16_t)
+    DUCKD_FILL_FIXED(arrow::Type::INT32,  int32_t,  int32_t)
+    DUCKD_FILL_FIXED(arrow::Type::INT64,  int64_t,  int64_t)
+    DUCKD_FILL_FIXED(arrow::Type::UINT8,  uint8_t,  uint8_t)
+    DUCKD_FILL_FIXED(arrow::Type::UINT16, uint16_t, uint16_t)
+    DUCKD_FILL_FIXED(arrow::Type::UINT32, uint32_t, uint32_t)
+    DUCKD_FILL_FIXED(arrow::Type::UINT64, uint64_t, uint64_t)
+    DUCKD_FILL_FIXED(arrow::Type::FLOAT,  float,    float)
+    DUCKD_FILL_FIXED(arrow::Type::DOUBLE, double,   double)
+#undef DUCKD_FILL_FIXED
+
+    // DATE32: Arrow = int32 days since Unix epoch; DuckDB date_t = int32 days
+    case arrow::Type::DATE32: {
+        static_assert(sizeof(date_t) == sizeof(int32_t), "date_t size mismatch");
+        const auto *sptr = src.data()->GetValues<int32_t>(1) + src_offset;
+        auto       *dptr = FlatVector::GetData<date_t>(dst);
+        std::memcpy(dptr, sptr, count * sizeof(int32_t));
+        break;
+    }
+
+    // TIME64(us): Arrow = int64 µs; DuckDB dtime_t = int64 µs
+    case arrow::Type::TIME64: {
+        static_assert(sizeof(dtime_t) == sizeof(int64_t), "dtime_t size mismatch");
+        const auto *sptr = src.data()->GetValues<int64_t>(1) + src_offset;
+        auto       *dptr = FlatVector::GetData<dtime_t>(dst);
+        std::memcpy(dptr, sptr, count * sizeof(int64_t));
+        break;
+    }
+
+    // TIMESTAMP(us): Arrow = int64 µs since epoch; DuckDB timestamp_t = int64 µs
+    case arrow::Type::TIMESTAMP: {
+        static_assert(sizeof(timestamp_t) == sizeof(int64_t), "timestamp_t size mismatch");
+        const auto *sptr = src.data()->GetValues<int64_t>(1) + src_offset;
+        auto       *dptr = FlatVector::GetData<timestamp_t>(dst);
+        std::memcpy(dptr, sptr, count * sizeof(int64_t));
+        break;
+    }
+
+    // STRING: iterate and intern into DuckDB's string heap
+    case arrow::Type::STRING: {
+        auto &arr  = static_cast<const arrow::StringArray &>(src);
+        auto *dptr = FlatVector::GetData<string_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                auto sv  = arr.GetView(src_offset + i);
+                dptr[i]  = StringVector::AddString(dst, sv.data(), sv.size());
+            }
+        }
+        break;
+    }
+
+    case arrow::Type::LARGE_STRING: {
+        auto &arr  = static_cast<const arrow::LargeStringArray &>(src);
+        auto *dptr = FlatVector::GetData<string_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                auto sv  = arr.GetView(src_offset + i);
+                dptr[i]  = StringVector::AddString(dst, sv.data(), sv.size());
+            }
+        }
+        break;
+    }
+
+    // BINARY / LARGE_BINARY → BLOB
+    case arrow::Type::BINARY: {
+        auto &arr  = static_cast<const arrow::BinaryArray &>(src);
+        auto *dptr = FlatVector::GetData<string_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                auto sv  = arr.GetView(src_offset + i);
+                dptr[i]  = StringVector::AddStringOrBlob(dst, sv.data(), sv.size());
+            }
+        }
+        break;
+    }
+
+    case arrow::Type::LARGE_BINARY: {
+        auto &arr  = static_cast<const arrow::LargeBinaryArray &>(src);
+        auto *dptr = FlatVector::GetData<string_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                auto sv  = arr.GetView(src_offset + i);
+                dptr[i]  = StringVector::AddStringOrBlob(dst, sv.data(), sv.size());
+            }
+        }
+        break;
+    }
+
+    default: {
+        // Fallback: row-by-row scalar boxing (covers DECIMAL128, nested types, …)
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                dst.SetValue(i, ArrowScalarToValue(src, src_offset + i));
+            }
+        }
+        break;
+    }
+
+    } // switch
+}
+
+//===----------------------------------------------------------------------===//
 // Utilities: TableFilter → SQL WHERE fragment
 //===----------------------------------------------------------------------===//
 
@@ -272,14 +423,17 @@ void DuckdTransactionManager::RollbackTransaction(Transaction &transaction) {
 }
 
 //===----------------------------------------------------------------------===//
-// DuckdScan – global state
+// DuckdScan – global state (streaming: holds an open FlightStreamReader)
 //===----------------------------------------------------------------------===//
 
 struct DuckdScanGlobalState : public GlobalTableFunctionState {
-    duckdb_client::DuckdQueryResult result;
-    idx_t                           batch_idx    = 0;
-    idx_t                           row_in_batch = 0;
-    bool                            finished     = false;
+    // Streaming reader; yields one RecordBatch per Next() call
+    std::unique_ptr<duckdb_client::DuckdQueryStream> stream;
+
+    // Current batch being drained into DuckDB DataChunks
+    std::shared_ptr<arrow::RecordBatch> current_batch;
+    idx_t                               row_in_batch = 0;
+    bool                                finished     = false;
 
     // output column i → Arrow batch column index (-1 = synthetic rowid)
     vector<int> output_to_arrow;
@@ -303,7 +457,7 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
 
     for (auto col_id : input.column_ids) {
         if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
-            output_to_arrow.push_back(-1); // synthetic zero
+            output_to_arrow.push_back(-1); // synthetic rowid
         } else {
             selected_cols.push_back(bd.column_names[col_id]);
             output_to_arrow.push_back(arrow_col_idx++);
@@ -338,14 +492,24 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
         sql += " WHERE " + StringUtil::Join(conditions, " AND ");
     }
 
-    // Execute via the shared Flight SQL client
-    auto result = bd.client->ExecuteQuery(sql);
-    if (!result.ok()) {
-        throw IOException("duckd: scan failed: " + result.status().ToString());
+    // Open a streaming scan — data is pulled batch-by-batch in DuckdScanFunction
+    auto stream_res = bd.client->ExecuteQueryStream(sql);
+    if (!stream_res.ok()) {
+        throw IOException("duckd: scan failed: " + stream_res.status().ToString());
+    }
+    state->stream = stream_res.MoveValueUnsafe();
+
+    // Pull the first batch so we know immediately if the result is empty
+    auto first = state->stream->Next();
+    if (!first.ok()) {
+        throw IOException("duckd: scan read failed: " + first.status().ToString());
+    }
+    if (*first) {
+        state->current_batch = std::move(*first);
+    } else {
+        state->finished = true;
     }
 
-    state->result   = result.MoveValueUnsafe();
-    state->finished = state->result.batches.empty();
     return std::move(state);
 }
 
@@ -358,46 +522,52 @@ static void DuckdScanFunction(ClientContext &ctx, TableFunctionInput &input,
         return;
     }
 
-    while (state.batch_idx < state.result.batches.size()) {
-        auto &batch   = state.result.batches[state.batch_idx];
-        auto  avail   = (idx_t)(batch->num_rows() - state.row_in_batch);
-
-        if (avail == 0) {
-            state.batch_idx++;
-            state.row_in_batch = 0;
-            continue;
+    // Advance to the next batch if the current one is exhausted
+    while (state.current_batch &&
+           state.row_in_batch >= (idx_t)state.current_batch->num_rows()) {
+        auto next = state.stream->Next();
+        if (!next.ok()) {
+            throw IOException("duckd: scan read failed: " + next.status().ToString());
         }
-
-        idx_t to_fill = MinValue<idx_t>(avail, (idx_t)STANDARD_VECTOR_SIZE);
-
-        for (idx_t out_col = 0; out_col < output.data.size(); out_col++) {
-            int arrow_col = state.output_to_arrow[out_col];
-            if (arrow_col < 0) {
-                // Synthetic rowid
-                for (idx_t row = 0; row < to_fill; row++) {
-                    output.data[out_col].SetValue(
-                        row, Value::BIGINT((int64_t)(state.row_in_batch + row)));
-                }
-            } else {
-                auto &col = *batch->column(arrow_col);
-                for (idx_t row = 0; row < to_fill; row++) {
-                    output.data[out_col].SetValue(
-                        row, ArrowScalarToValue(col, (int64_t)(state.row_in_batch + row)));
-                }
-            }
+        if (!*next) {
+            state.finished      = true;
+            state.current_batch = nullptr;
+            output.SetCardinality(0);
+            return;
         }
+        state.current_batch = std::move(*next);
+        state.row_in_batch  = 0;
+    }
 
-        output.SetCardinality(to_fill);
-        state.row_in_batch += to_fill;
-        if ((idx_t)batch->num_rows() <= state.row_in_batch) {
-            state.batch_idx++;
-            state.row_in_batch = 0;
-        }
+    if (!state.current_batch) {
+        state.finished = true;
+        output.SetCardinality(0);
         return;
     }
 
-    state.finished = true;
-    output.SetCardinality(0);
+    auto  &batch   = *state.current_batch;
+    idx_t  avail   = (idx_t)batch.num_rows() - state.row_in_batch;
+    idx_t  to_fill = MinValue<idx_t>(avail, (idx_t)STANDARD_VECTOR_SIZE);
+
+    for (idx_t out_col = 0; out_col < output.data.size(); out_col++) {
+        int arrow_col = state.output_to_arrow[out_col];
+        if (arrow_col < 0) {
+            // Synthetic rowid: fill sequentially
+            auto *data = FlatVector::GetData<int64_t>(output.data[out_col]);
+            for (idx_t i = 0; i < to_fill; i++) {
+                data[i] = (int64_t)(state.row_in_batch + i);
+            }
+        } else {
+            // Zero-copy columnar fill from Arrow buffer
+            FillColumnFromArrow(output.data[out_col],
+                                *batch.column(arrow_col),
+                                (int64_t)state.row_in_batch,
+                                to_fill);
+        }
+    }
+
+    output.SetCardinality(to_fill);
+    state.row_in_batch += to_fill;
 }
 
 //===----------------------------------------------------------------------===//

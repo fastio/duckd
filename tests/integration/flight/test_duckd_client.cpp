@@ -723,6 +723,84 @@ static int TestErrorHandling(DuckdClientTest &t) {
 }
 
 //===----------------------------------------------------------------------===//
+// Tests: streaming scan via ATTACH catalog (P1+P2)
+//
+// Verifies that the streaming scan correctly handles multi-batch result sets
+// without buffering all data in memory.
+//===----------------------------------------------------------------------===//
+
+static int TestStreamingScan(DuckdClientTest &t) {
+    int passed = 0, failed = 0;
+
+    // Pre-populate a large table on the server via duckd_exec
+    t.conn().Query(
+        "SELECT duckd_exec('" + t.url() + "',"
+        " 'CREATE TABLE IF NOT EXISTS stream_test AS"
+        "  SELECT i, i * 2 AS j FROM generate_series(1, 5000) t(i)')");
+
+    TEST_BEGIN("streaming scan: ATTACH + large table (5000 rows via catalog)");
+    {
+        auto ar = t.conn().Query(
+            "ATTACH '" + t.url() + "' AS stream_cat (TYPE duckd)");
+        if (ar->HasError()) {
+            TEST_FAIL("ATTACH: " + ar->GetError());
+        } else {
+            auto r = t.conn().Query(
+                "SELECT COUNT(*) AS cnt, SUM(j) AS total"
+                " FROM stream_cat.main.stream_test");
+            t.conn().Query("DETACH stream_cat");
+            if (r->HasError()) {
+                TEST_FAIL(r->GetError());
+            } else {
+                auto cnt   = r->GetValue(0, 0).GetValue<int64_t>();
+                auto total = r->GetValue(1, 0).GetValue<int64_t>();
+                // SUM(2*i for i=1..5000) = 2 * 5000*5001/2 = 25005000
+                if (cnt != 5000 || total != 25005000LL) {
+                    TEST_FAIL("expected cnt=5000 total=25005000; got cnt=" +
+                              std::to_string(cnt) + " total=" + std::to_string(total));
+                } else {
+                    TEST_PASS();
+                }
+            }
+        }
+    }
+
+    TEST_BEGIN("streaming scan: projection pushdown across multiple batches");
+    {
+        auto ar = t.conn().Query(
+            "ATTACH '" + t.url() + "' AS stream_proj (TYPE duckd)");
+        if (ar->HasError()) {
+            TEST_FAIL("ATTACH: " + ar->GetError());
+        } else {
+            // SELECT only 'i' (projection pushdown) and filter on server side
+            auto r = t.conn().Query(
+                "SELECT SUM(i) AS s"
+                " FROM stream_proj.main.stream_test"
+                " WHERE i <= 100");
+            t.conn().Query("DETACH stream_proj");
+            if (r->HasError()) {
+                TEST_FAIL(r->GetError());
+            } else {
+                auto s = r->GetValue(0, 0).GetValue<int64_t>();
+                // SUM(1..100) = 5050
+                if (s != 5050LL) {
+                    TEST_FAIL("expected 5050, got " + std::to_string(s));
+                } else {
+                    TEST_PASS();
+                }
+            }
+        }
+    }
+
+    // Cleanup
+    t.conn().Query(
+        "SELECT duckd_exec('" + t.url() + "',"
+        " 'DROP TABLE IF EXISTS stream_test')");
+
+    return failed;
+}
+
+//===----------------------------------------------------------------------===//
 // Tests: connection registry (P6 – connection pooling)
 //===----------------------------------------------------------------------===//
 
@@ -882,6 +960,12 @@ int main() {
         std::cout << "\n--- Concurrency Tests ---" << std::endl;
         DuckdClientTest t;
         total_failures += TestConcurrency(t);
+    }
+
+    {
+        std::cout << "\n--- Streaming Scan Tests (P1+P2) ---" << std::endl;
+        DuckdClientTest t;
+        total_failures += TestStreamingScan(t);
     }
 
     {

@@ -59,6 +59,60 @@ arrow::Result<DuckdQueryResult> DuckdFlightClient::ExecuteQuery(const std::strin
 }
 
 //===----------------------------------------------------------------------===//
+// DuckdQueryStream::Next
+//===----------------------------------------------------------------------===//
+
+arrow::Result<std::shared_ptr<arrow::RecordBatch>> DuckdQueryStream::Next() {
+    while (true) {
+        if (current_stream_) {
+            ARROW_ASSIGN_OR_RAISE(auto chunk, current_stream_->Next());
+            if (chunk.data) {
+                return chunk.data;
+            }
+            // Current endpoint exhausted; move to next
+            current_stream_.reset();
+        }
+
+        if (ep_idx_ >= endpoints_.size()) {
+            return nullptr; // all endpoints consumed
+        }
+
+        ARROW_ASSIGN_OR_RAISE(current_stream_,
+            sql_client_->DoGet(call_options_, endpoints_[ep_idx_++].ticket));
+
+        // Populate schema from the first endpoint if not yet set
+        if (!schema_) {
+            ARROW_ASSIGN_OR_RAISE(schema_, current_stream_->GetSchema());
+        }
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// ExecuteQueryStream
+//===----------------------------------------------------------------------===//
+
+arrow::Result<std::unique_ptr<DuckdQueryStream>>
+DuckdFlightClient::ExecuteQueryStream(const std::string& sql) {
+    ARROW_ASSIGN_OR_RAISE(auto info, client_->Execute(call_options_, sql));
+
+    auto stream = std::unique_ptr<DuckdQueryStream>(new DuckdQueryStream());
+    stream->endpoints_   = info->endpoints();
+    stream->sql_client_  = client_.get();
+    stream->call_options_ = call_options_;
+
+    // Open the first endpoint immediately so the schema is available before
+    // the caller starts pulling batches.
+    if (!stream->endpoints_.empty()) {
+        ARROW_ASSIGN_OR_RAISE(stream->current_stream_,
+            client_->DoGet(call_options_, stream->endpoints_[0].ticket));
+        stream->ep_idx_ = 1;
+        ARROW_ASSIGN_OR_RAISE(stream->schema_, stream->current_stream_->GetSchema());
+    }
+
+    return std::move(stream);
+}
+
+//===----------------------------------------------------------------------===//
 // ExecuteQueryStreaming
 //===----------------------------------------------------------------------===//
 

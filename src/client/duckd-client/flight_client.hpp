@@ -25,13 +25,49 @@ namespace flight    = arrow::flight;
 namespace flightsql = arrow::flight::sql;
 
 //===----------------------------------------------------------------------===//
-// Query result container
+// Query result container (buffered, used by helpers that need all rows)
 //===----------------------------------------------------------------------===//
 
 struct DuckdQueryResult {
     std::shared_ptr<arrow::Schema>                    schema;
     std::vector<std::shared_ptr<arrow::RecordBatch>>  batches;
     int64_t                                           total_rows = 0;
+};
+
+//===----------------------------------------------------------------------===//
+// DuckdQueryStream - pull-based streaming reader (one batch at a time)
+//
+// Holds an open FlightStreamReader and yields RecordBatches on demand.
+// Not thread-safe; use from a single thread only (scan function is single-
+// threaded since MaxThreads() returns 1).
+//===----------------------------------------------------------------------===//
+
+class DuckdQueryStream {
+public:
+    DuckdQueryStream() = default;
+    ~DuckdQueryStream() = default;
+
+    // Non-copyable, movable
+    DuckdQueryStream(const DuckdQueryStream &) = delete;
+    DuckdQueryStream &operator=(const DuckdQueryStream &) = delete;
+    DuckdQueryStream(DuckdQueryStream &&) = default;
+    DuckdQueryStream &operator=(DuckdQueryStream &&) = default;
+
+    // Arrow schema of the result (available after the stream is opened).
+    const std::shared_ptr<arrow::Schema> &schema() const { return schema_; }
+
+    // Pull the next batch.  Returns nullptr (not an error) when exhausted.
+    arrow::Result<std::shared_ptr<arrow::RecordBatch>> Next();
+
+private:
+    friend class DuckdFlightClient;
+
+    std::unique_ptr<flight::FlightStreamReader> current_stream_;
+    std::vector<flight::FlightEndpoint>         endpoints_;
+    size_t                                      ep_idx_      = 0;
+    flightsql::FlightSqlClient                 *sql_client_  = nullptr;
+    flight::FlightCallOptions                   call_options_;
+    std::shared_ptr<arrow::Schema>              schema_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -43,8 +79,13 @@ public:
     // Connect to a duckd server.  url must be grpc://host:port.
     static std::unique_ptr<DuckdFlightClient> Connect(const std::string& url);
 
-    // Execute a SELECT query; returns all result batches.
+    // Execute a SELECT query; returns all result batches (buffered).
     arrow::Result<DuckdQueryResult> ExecuteQuery(const std::string& sql);
+
+    // Execute a SELECT query and return a streaming reader (one batch at a time).
+    // Preferred for large result sets; avoids buffering all data in memory.
+    arrow::Result<std::unique_ptr<DuckdQueryStream>> ExecuteQueryStream(
+        const std::string& sql);
 
     // Execute a SELECT query, calling callback once per batch (streaming).
     arrow::Result<int64_t> ExecuteQueryStreaming(
