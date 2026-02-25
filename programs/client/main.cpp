@@ -1,691 +1,199 @@
 //===----------------------------------------------------------------------===//
-//                         DuckDB Remote CLI
+//                         DuckD CLI
 //
-// duckdb_remote_cli.cpp
+// programs/client/main.cpp
 //
-// Interactive CLI client for DuckDB Server - mimics DuckDB shell interface
+// Interactive SQL shell for DuckD server via Arrow Flight SQL.
+// Embeds a local DuckDB instance with the duckd_client extension loaded and
+// ATTACHes the remote server as a named catalog.
+//
+// Usage:
+//   duckd-cli grpc://host:8815          -- default catalog alias "remote"
+//   duckd-cli grpc://host:8815 mydb     -- custom alias
+//
+// Once connected, all standard DuckDB SQL is available.
+// Tables on the remote server are accessed as:
+//   SELECT * FROM remote.main.my_table;
+// or simply set the search path:
+//   SET search_path = 'remote.main';
+//   SELECT * FROM my_table;
 //===----------------------------------------------------------------------===//
 
-#include "remote_client.hpp"
+#include "duckdb.hpp"
 #include <iostream>
-#include <sstream>
-#include <iomanip>
-#include <algorithm>
+#include <string>
+
+#ifdef DUCKD_WITH_FLIGHT_SQL
+// Extension entry point from the statically linked duckd_flight_client_static
+extern "C" void duckd_client_init(duckdb::DatabaseInstance &db);
+#endif
+
 #include <readline/readline.h>
 #include <readline/history.h>
 
-using namespace duckdb;
-
-//===----------------------------------------------------------------------===//
-// Output Modes
-//===----------------------------------------------------------------------===//
-
-enum class OutputMode {
-    BOX,      // Unicode box drawing (default)
-    TABLE,    // ASCII table
-    CSV,      // CSV format
-    LINE,     // One value per line
-    LIST,     // Values separated by delimiter
-    COLUMN,   // Aligned columns
-    MARKDOWN, // Markdown table
-    JSON,     // JSON format
-    JSONLINES // JSON Lines format
-};
-
-//===----------------------------------------------------------------------===//
-// CLI State
-//===----------------------------------------------------------------------===//
-
-struct CLIState {
-    std::string host = "localhost";
-    uint16_t port = 9999;
-    std::string username;
-    OutputMode mode = OutputMode::BOX;
-    std::string separator = "|";
-    bool headers = true;
-    bool timing = false;
-    bool connected = false;
-    std::unique_ptr<RemoteClient> client;
-    int width = 0;  // 0 = auto
-};
-
-//===----------------------------------------------------------------------===//
-// String Utilities
-//===----------------------------------------------------------------------===//
-
-std::string Trim(const std::string& str) {
-    size_t start = str.find_first_not_of(" \t\n\r");
-    if (start == std::string::npos) return "";
-    size_t end = str.find_last_not_of(" \t\n\r");
-    return str.substr(start, end - start + 1);
+static std::string Trim(const std::string &s) {
+    auto b = s.find_first_not_of(" \t\n\r");
+    if (b == std::string::npos) return "";
+    auto e = s.find_last_not_of(" \t\n\r");
+    return s.substr(b, e - b + 1);
 }
 
-std::string ToLower(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(), ::tolower);
-    return result;
+static void PrintHelp(const std::string &alias) {
+    std::cout <<
+        "\nDuckD CLI – connected via Arrow Flight SQL\n"
+        "\nMeta commands:\n"
+        "  .help           Show this message\n"
+        "  .quit / .exit   Exit the shell\n"
+        "  .tables         List remote tables  (main schema)\n"
+        "  .schema TABLE   Show column info for TABLE\n"
+        "\nSQL tips:\n"
+        "  Terminate statements with ';'\n"
+        "  Remote tables: " << alias << ".main.tablename\n"
+        "  Or: SET search_path='" << alias << ".main'; SELECT * FROM tablename;\n\n";
 }
 
-std::string ValueToString(const Value& val) {
-    if (val.IsNull()) {
-        return "NULL";
-    }
-    return val.ToString();
-}
-
-size_t DisplayWidth(const std::string& str) {
-    // Simple implementation - doesn't handle Unicode width correctly
-    // but good enough for basic use
-    return str.length();
-}
-
-//===----------------------------------------------------------------------===//
-// Output Formatters
-//===----------------------------------------------------------------------===//
-
-void PrintBoxTable(const RemoteQueryResult& result, bool headers) {
-    if (result.columns.empty()) return;
-
-    size_t num_cols = result.columns.size();
-    std::vector<size_t> widths(num_cols, 0);
-
-    // Calculate column widths
-    for (size_t i = 0; i < num_cols; i++) {
-        widths[i] = DisplayWidth(result.columns[i].name);
-    }
-    for (const auto& row : result.rows) {
-        for (size_t i = 0; i < std::min(num_cols, row.size()); i++) {
-            widths[i] = std::max(widths[i], DisplayWidth(ValueToString(row[i])));
-        }
-    }
-
-    // Box drawing characters
-    const char* h = "─";
-    const char* v = "│";
-    const char* tl = "┌"; const char* tm = "┬"; const char* tr = "┐";
-    const char* ml = "├"; const char* mm = "┼"; const char* mr = "┤";
-    const char* bl = "└"; const char* bm = "┴"; const char* br = "┘";
-
-    // Print top border
-    std::cout << tl;
-    for (size_t i = 0; i < num_cols; i++) {
-        for (size_t j = 0; j < widths[i] + 2; j++) std::cout << h;
-        std::cout << (i < num_cols - 1 ? tm : tr);
-    }
-    std::cout << "\n";
-
-    // Print header
-    if (headers) {
-        std::cout << v;
-        for (size_t i = 0; i < num_cols; i++) {
-            std::cout << " " << std::left << std::setw(widths[i]) << result.columns[i].name << " " << v;
-        }
-        std::cout << "\n";
-
-        // Print header separator
-        std::cout << ml;
-        for (size_t i = 0; i < num_cols; i++) {
-            for (size_t j = 0; j < widths[i] + 2; j++) std::cout << h;
-            std::cout << (i < num_cols - 1 ? mm : mr);
-        }
-        std::cout << "\n";
-    }
-
-    // Print rows
-    for (const auto& row : result.rows) {
-        std::cout << v;
-        for (size_t i = 0; i < num_cols; i++) {
-            std::string val = i < row.size() ? ValueToString(row[i]) : "";
-            std::cout << " " << std::left << std::setw(widths[i]) << val << " " << v;
-        }
-        std::cout << "\n";
-    }
-
-    // Print bottom border
-    std::cout << bl;
-    for (size_t i = 0; i < num_cols; i++) {
-        for (size_t j = 0; j < widths[i] + 2; j++) std::cout << h;
-        std::cout << (i < num_cols - 1 ? bm : br);
-    }
-    std::cout << "\n";
-}
-
-void PrintASCIITable(const RemoteQueryResult& result, bool headers) {
-    if (result.columns.empty()) return;
-
-    size_t num_cols = result.columns.size();
-    std::vector<size_t> widths(num_cols, 0);
-
-    for (size_t i = 0; i < num_cols; i++) {
-        widths[i] = DisplayWidth(result.columns[i].name);
-    }
-    for (const auto& row : result.rows) {
-        for (size_t i = 0; i < std::min(num_cols, row.size()); i++) {
-            widths[i] = std::max(widths[i], DisplayWidth(ValueToString(row[i])));
-        }
-    }
-
-    auto print_separator = [&]() {
-        std::cout << "+";
-        for (size_t i = 0; i < num_cols; i++) {
-            for (size_t j = 0; j < widths[i] + 2; j++) std::cout << "-";
-            std::cout << "+";
-        }
-        std::cout << "\n";
-    };
-
-    print_separator();
-
-    if (headers) {
-        std::cout << "|";
-        for (size_t i = 0; i < num_cols; i++) {
-            std::cout << " " << std::left << std::setw(widths[i]) << result.columns[i].name << " |";
-        }
-        std::cout << "\n";
-        print_separator();
-    }
-
-    for (const auto& row : result.rows) {
-        std::cout << "|";
-        for (size_t i = 0; i < num_cols; i++) {
-            std::string val = i < row.size() ? ValueToString(row[i]) : "";
-            std::cout << " " << std::left << std::setw(widths[i]) << val << " |";
-        }
-        std::cout << "\n";
-    }
-
-    print_separator();
-}
-
-void PrintCSV(const RemoteQueryResult& result, bool headers) {
-    if (headers) {
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            if (i > 0) std::cout << ",";
-            std::cout << "\"" << result.columns[i].name << "\"";
-        }
-        std::cout << "\n";
-    }
-
-    for (const auto& row : result.rows) {
-        for (size_t i = 0; i < row.size(); i++) {
-            if (i > 0) std::cout << ",";
-            std::string val = ValueToString(row[i]);
-            if (val.find(',') != std::string::npos || val.find('"') != std::string::npos) {
-                // Escape quotes and wrap in quotes
-                std::string escaped;
-                for (char c : val) {
-                    if (c == '"') escaped += "\"\"";
-                    else escaped += c;
-                }
-                std::cout << "\"" << escaped << "\"";
-            } else {
-                std::cout << val;
-            }
-        }
-        std::cout << "\n";
-    }
-}
-
-void PrintLine(const RemoteQueryResult& result) {
-    for (size_t row_idx = 0; row_idx < result.rows.size(); row_idx++) {
-        const auto& row = result.rows[row_idx];
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            std::cout << result.columns[i].name << " = "
-                      << (i < row.size() ? ValueToString(row[i]) : "") << "\n";
-        }
-        if (row_idx < result.rows.size() - 1) {
-            std::cout << "\n";
-        }
-    }
-}
-
-void PrintList(const RemoteQueryResult& result, const std::string& sep, bool headers) {
-    if (headers) {
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            if (i > 0) std::cout << sep;
-            std::cout << result.columns[i].name;
-        }
-        std::cout << "\n";
-    }
-
-    for (const auto& row : result.rows) {
-        for (size_t i = 0; i < row.size(); i++) {
-            if (i > 0) std::cout << sep;
-            std::cout << ValueToString(row[i]);
-        }
-        std::cout << "\n";
-    }
-}
-
-void PrintMarkdown(const RemoteQueryResult& result) {
-    if (result.columns.empty()) return;
-
-    size_t num_cols = result.columns.size();
-    std::vector<size_t> widths(num_cols, 0);
-
-    for (size_t i = 0; i < num_cols; i++) {
-        widths[i] = std::max(widths[i], DisplayWidth(result.columns[i].name));
-    }
-    for (const auto& row : result.rows) {
-        for (size_t i = 0; i < std::min(num_cols, row.size()); i++) {
-            widths[i] = std::max(widths[i], DisplayWidth(ValueToString(row[i])));
-        }
-    }
-
-    // Header
-    std::cout << "|";
-    for (size_t i = 0; i < num_cols; i++) {
-        std::cout << " " << std::left << std::setw(widths[i]) << result.columns[i].name << " |";
-    }
-    std::cout << "\n";
-
-    // Separator
-    std::cout << "|";
-    for (size_t i = 0; i < num_cols; i++) {
-        std::cout << "-" << std::string(widths[i], '-') << "-|";
-    }
-    std::cout << "\n";
-
-    // Rows
-    for (const auto& row : result.rows) {
-        std::cout << "|";
-        for (size_t i = 0; i < num_cols; i++) {
-            std::string val = i < row.size() ? ValueToString(row[i]) : "";
-            std::cout << " " << std::left << std::setw(widths[i]) << val << " |";
-        }
-        std::cout << "\n";
-    }
-}
-
-void PrintJSON(const RemoteQueryResult& result) {
-    std::cout << "[\n";
-    for (size_t row_idx = 0; row_idx < result.rows.size(); row_idx++) {
-        const auto& row = result.rows[row_idx];
-        std::cout << "  {";
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            if (i > 0) std::cout << ", ";
-            std::cout << "\"" << result.columns[i].name << "\": ";
-            if (i < row.size() && !row[i].IsNull()) {
-                std::string val = row[i].ToString();
-                // Check if numeric
-                if (result.columns[i].type.IsNumeric()) {
-                    std::cout << val;
-                } else {
-                    std::cout << "\"" << val << "\"";
-                }
-            } else {
-                std::cout << "null";
-            }
-        }
-        std::cout << "}" << (row_idx < result.rows.size() - 1 ? "," : "") << "\n";
-    }
-    std::cout << "]\n";
-}
-
-void PrintJSONLines(const RemoteQueryResult& result) {
-    for (const auto& row : result.rows) {
-        std::cout << "{";
-        for (size_t i = 0; i < result.columns.size(); i++) {
-            if (i > 0) std::cout << ", ";
-            std::cout << "\"" << result.columns[i].name << "\": ";
-            if (i < row.size() && !row[i].IsNull()) {
-                std::string val = row[i].ToString();
-                if (result.columns[i].type.IsNumeric()) {
-                    std::cout << val;
-                } else {
-                    std::cout << "\"" << val << "\"";
-                }
-            } else {
-                std::cout << "null";
-            }
-        }
-        std::cout << "}\n";
-    }
-}
-
-void PrintResult(const RemoteQueryResult& result, const CLIState& state) {
-    if (result.columns.empty() && result.rows.empty()) {
+static void PrintResult(duckdb::QueryResult &res) {
+    if (res.HasError()) {
+        std::cerr << "Error: " << res.GetError() << "\n";
         return;
     }
+    auto &mat = res.Cast<duckdb::MaterializedQueryResult>();
 
-    switch (state.mode) {
-    case OutputMode::BOX:
-        PrintBoxTable(result, state.headers);
-        break;
-    case OutputMode::TABLE:
-        PrintASCIITable(result, state.headers);
-        break;
-    case OutputMode::CSV:
-        PrintCSV(result, state.headers);
-        break;
-    case OutputMode::LINE:
-        PrintLine(result);
-        break;
-    case OutputMode::LIST:
-        PrintList(result, state.separator, state.headers);
-        break;
-    case OutputMode::COLUMN:
-        PrintASCIITable(result, state.headers);  // Same as table for now
-        break;
-    case OutputMode::MARKDOWN:
-        PrintMarkdown(result);
-        break;
-    case OutputMode::JSON:
-        PrintJSON(result);
-        break;
-    case OutputMode::JSONLINES:
-        PrintJSONLines(result);
-        break;
+    // header
+    std::cout << "\n";
+    for (idx_t c = 0; c < mat.ColumnCount(); c++) {
+        if (c) std::cout << "\t";
+        std::cout << mat.ColumnName(c);
     }
-}
-
-//===----------------------------------------------------------------------===//
-// Meta Commands
-//===----------------------------------------------------------------------===//
-
-void PrintHelp() {
-    std::cout << R"(
-DuckDB Remote CLI - Connected to remote DuckDB Server
-
-Meta Commands:
-  .help                 Show this help message
-  .quit, .exit          Exit the CLI
-  .mode MODE            Set output mode (box, table, csv, line, list, markdown, json, jsonlines)
-  .headers on|off       Toggle column headers
-  .separator SEP        Set separator for list mode
-  .timing on|off        Toggle timing display
-  .status               Show connection status
-  .tables               List tables in remote database
-  .schema [TABLE]       Show schema of table(s)
-
-SQL Commands:
-  Enter any SQL statement followed by semicolon (;) or press Enter on a complete statement.
-  Multi-line statements are supported.
-
-Examples:
-  SELECT * FROM my_table;
-  CREATE TABLE test (id INTEGER, name VARCHAR);
-  INSERT INTO test VALUES (1, 'hello');
-
-)";
-}
-
-bool HandleMetaCommand(const std::string& cmd, CLIState& state) {
-    std::string lower = ToLower(Trim(cmd));
-
-    if (lower == ".help" || lower == ".h") {
-        PrintHelp();
-        return true;
+    std::cout << "\n";
+    for (idx_t c = 0; c < mat.ColumnCount(); c++) {
+        if (c) std::cout << "\t";
+        std::cout << std::string(mat.ColumnName(c).size(), '-');
     }
+    std::cout << "\n";
 
-    if (lower == ".quit" || lower == ".exit" || lower == ".q") {
-        std::cout << "Goodbye!\n";
-        exit(0);
-    }
-
-    if (lower == ".status") {
-        std::cout << "Connected: " << (state.connected ? "yes" : "no") << "\n";
-        std::cout << "Server: " << state.host << ":" << state.port << "\n";
-        if (state.connected) {
-            std::cout << "Session ID: " << state.client->GetSessionId() << "\n";
-        }
-        std::cout << "Output mode: ";
-        switch (state.mode) {
-            case OutputMode::BOX: std::cout << "box"; break;
-            case OutputMode::TABLE: std::cout << "table"; break;
-            case OutputMode::CSV: std::cout << "csv"; break;
-            case OutputMode::LINE: std::cout << "line"; break;
-            case OutputMode::LIST: std::cout << "list"; break;
-            case OutputMode::COLUMN: std::cout << "column"; break;
-            case OutputMode::MARKDOWN: std::cout << "markdown"; break;
-            case OutputMode::JSON: std::cout << "json"; break;
-            case OutputMode::JSONLINES: std::cout << "jsonlines"; break;
+    idx_t rows = mat.RowCount();
+    for (idx_t r = 0; r < rows; r++) {
+        for (idx_t c = 0; c < mat.ColumnCount(); c++) {
+            if (c) std::cout << "\t";
+            std::cout << mat.GetValue(c, r).ToString();
         }
         std::cout << "\n";
-        return true;
     }
-
-    if (lower.substr(0, 5) == ".mode") {
-        std::string mode_str = Trim(cmd.substr(5));
-        mode_str = ToLower(mode_str);
-
-        if (mode_str == "box") state.mode = OutputMode::BOX;
-        else if (mode_str == "table") state.mode = OutputMode::TABLE;
-        else if (mode_str == "csv") state.mode = OutputMode::CSV;
-        else if (mode_str == "line") state.mode = OutputMode::LINE;
-        else if (mode_str == "list") state.mode = OutputMode::LIST;
-        else if (mode_str == "column") state.mode = OutputMode::COLUMN;
-        else if (mode_str == "markdown" || mode_str == "md") state.mode = OutputMode::MARKDOWN;
-        else if (mode_str == "json") state.mode = OutputMode::JSON;
-        else if (mode_str == "jsonlines" || mode_str == "ndjson") state.mode = OutputMode::JSONLINES;
-        else {
-            std::cout << "Unknown mode: " << mode_str << "\n";
-            std::cout << "Available modes: box, table, csv, line, list, column, markdown, json, jsonlines\n";
-        }
-        return true;
-    }
-
-    if (lower.substr(0, 8) == ".headers") {
-        std::string val = Trim(ToLower(cmd.substr(8)));
-        if (val == "on" || val == "1" || val == "true") {
-            state.headers = true;
-        } else if (val == "off" || val == "0" || val == "false") {
-            state.headers = false;
-        } else {
-            std::cout << "Usage: .headers on|off\n";
-        }
-        return true;
-    }
-
-    if (lower.substr(0, 10) == ".separator") {
-        state.separator = Trim(cmd.substr(10));
-        if (state.separator.empty()) state.separator = "|";
-        return true;
-    }
-
-    if (lower.substr(0, 7) == ".timing") {
-        std::string val = Trim(ToLower(cmd.substr(7)));
-        if (val == "on" || val == "1" || val == "true") {
-            state.timing = true;
-        } else if (val == "off" || val == "0" || val == "false") {
-            state.timing = false;
-        } else {
-            std::cout << "Usage: .timing on|off\n";
-        }
-        return true;
-    }
-
-    if (lower == ".tables") {
-        if (!state.connected) {
-            std::cout << "Not connected\n";
-            return true;
-        }
-        auto result = state.client->Query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main' ORDER BY table_name");
-        if (result->has_error) {
-            std::cout << "Error: " << result->error_message << "\n";
-        } else {
-            PrintResult(*result, state);
-        }
-        return true;
-    }
-
-    if (lower.substr(0, 7) == ".schema") {
-        if (!state.connected) {
-            std::cout << "Not connected\n";
-            return true;
-        }
-        std::string table = Trim(cmd.substr(7));
-        std::string sql;
-        if (table.empty()) {
-            sql = "SELECT table_name, column_name, data_type FROM information_schema.columns ORDER BY table_name, ordinal_position";
-        } else {
-            sql = "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '" + table + "' ORDER BY ordinal_position";
-        }
-        auto result = state.client->Query(sql);
-        if (result->has_error) {
-            std::cout << "Error: " << result->error_message << "\n";
-        } else {
-            PrintResult(*result, state);
-        }
-        return true;
-    }
-
-    std::cout << "Unknown command: " << cmd << "\n";
-    std::cout << "Use .help for available commands\n";
-    return true;
+    std::cout << "(" << rows << " row" << (rows != 1 ? "s" : "") << ")\n\n";
 }
 
-//===----------------------------------------------------------------------===//
-// Main REPL
-//===----------------------------------------------------------------------===//
+int main(int argc, char *argv[]) {
+    std::string url   = "grpc://localhost:8815";
+    std::string alias = "remote";
 
-void PrintBanner(const CLIState& state) {
-    std::cout << R"(
-DuckDB Remote CLI v1.0.0
-Connected to )" << state.host << ":" << state.port << R"(
-Enter ".help" for usage hints.
-)";
-}
-
-std::string GetPrompt(bool continuation) {
-    return continuation ? "   ...> " : "D remote> ";
-}
-
-int main(int argc, char* argv[]) {
-    CLIState state;
-
-    // Parse command line arguments
-    for (int i = 1; i < argc; i++) {
-        std::string arg = argv[i];
-        if ((arg == "-h" || arg == "--host") && i + 1 < argc) {
-            state.host = argv[++i];
-        } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-            state.port = static_cast<uint16_t>(std::stoi(argv[++i]));
-        } else if ((arg == "-u" || arg == "--user") && i + 1 < argc) {
-            state.username = argv[++i];
-        } else if (arg == "--help") {
-            std::cout << "Usage: " << argv[0] << " [OPTIONS]\n";
-            std::cout << "\nOptions:\n";
-            std::cout << "  -h, --host HOST    Server hostname (default: localhost)\n";
-            std::cout << "  -p, --port PORT    Server port (default: 9999)\n";
-            std::cout << "  -u, --user USER    Username\n";
-            std::cout << "  --help             Show this help\n";
+    if (argc >= 2) {
+        std::string a = argv[1];
+        if (a == "--help" || a == "-h") {
+            std::cout <<
+                "Usage: " << argv[0] << " [grpc://HOST:PORT] [ALIAS]\n"
+                "\n"
+                "  grpc://HOST:PORT   DuckD Flight SQL endpoint  (default: grpc://localhost:8815)\n"
+                "  ALIAS              Local catalog alias         (default: remote)\n";
             return 0;
-        } else if (arg[0] != '-') {
-            // Assume it's host:port
-            size_t colon = arg.find(':');
-            if (colon != std::string::npos) {
-                state.host = arg.substr(0, colon);
-                state.port = static_cast<uint16_t>(std::stoi(arg.substr(colon + 1)));
-            } else {
-                state.host = arg;
-            }
+        }
+        url = a;
+    }
+    if (argc >= 3) alias = argv[2];
+
+#ifndef DUCKD_WITH_FLIGHT_SQL
+    std::cerr << "duckd-cli was built without Arrow Flight SQL support.\n"
+                 "Rebuild with -DWITH_FLIGHT_SQL=ON.\n";
+    return 1;
+#else
+    // Bootstrap local DuckDB + extension
+    duckdb::DuckDB local_db(nullptr);
+    duckd_client_init(*local_db.instance);
+    duckdb::Connection conn(local_db);
+
+    // Attach remote server
+    {
+        auto r = conn.Query(
+            "ATTACH '" + url + "' AS " + alias + " (TYPE duckd)");
+        if (r->HasError()) {
+            std::cerr << "Failed to connect to " << url << ":\n"
+                      << r->GetError() << "\n";
+            return 1;
         }
     }
 
-    // Connect to server
-    state.client = std::make_unique<RemoteClient>();
-    try {
-        state.client->Connect(state.host, state.port, state.username);
-        state.connected = true;
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to connect to " << state.host << ":" << state.port << "\n";
-        std::cerr << "Error: " << e.what() << "\n";
-        return 1;
-    }
+    std::cout << "DuckD CLI – connected to " << url
+              << " (catalog alias: " << alias << ")\n"
+                 "Enter SQL followed by ';'  |  .help for tips  |  .quit to exit\n\n";
 
-    PrintBanner(state);
-
-    // Setup readline
     using_history();
 
-    std::string query_buffer;
-    bool in_multiline = false;
+    std::string buf;
+    bool multiline = false;
 
     while (true) {
-        char* line = readline(GetPrompt(in_multiline).c_str());
-        if (!line) {
-            // EOF (Ctrl+D)
-            std::cout << "\nGoodbye!\n";
-            break;
-        }
+        const char *prompt = multiline ? "   ...> " : "duckd> ";
+        char *raw = readline(prompt);
+        if (!raw) { std::cout << "\nBye!\n"; break; }
 
-        std::string input(line);
-        free(line);
+        std::string line(raw);
+        free(raw);
 
-        // Skip empty lines
-        if (Trim(input).empty()) {
-            continue;
-        }
+        if (Trim(line).empty()) continue;
+        add_history(line.c_str());
 
-        // Add to history
-        add_history(input.c_str());
+        // Meta commands (only at start of a fresh statement)
+        if (!multiline) {
+            std::string low;
+            low.resize(line.size());
+            std::transform(line.begin(), line.end(), low.begin(), ::tolower);
+            std::string trimlow = Trim(low);
 
-        // Check for meta commands (only at start of input)
-        if (!in_multiline && input[0] == '.') {
-            HandleMetaCommand(input, state);
-            continue;
-        }
-
-        // Accumulate query
-        if (!query_buffer.empty()) {
-            query_buffer += "\n";
-        }
-        query_buffer += input;
-
-        // Check if query is complete (ends with semicolon)
-        std::string trimmed = Trim(query_buffer);
-        if (trimmed.empty()) {
-            continue;
-        }
-
-        if (trimmed.back() != ';') {
-            in_multiline = true;
-            continue;
-        }
-
-        in_multiline = false;
-
-        // Execute query
-        try {
-            auto start = std::chrono::steady_clock::now();
-            auto result = state.client->Query(query_buffer);
-            auto end = std::chrono::steady_clock::now();
-
-            if (result->has_error) {
-                std::cout << "Error: " << result->error_message << "\n";
-            } else {
-                PrintResult(*result, state);
-
-                // Print row count and timing
-                if (!result->rows.empty() || !result->columns.empty()) {
-                    std::cout << result->rows.size() << " row" << (result->rows.size() != 1 ? "s" : "");
-                    if (state.timing) {
-                        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
-                        if (duration.count() < 1000) {
-                            std::cout << " (" << duration.count() << " us)";
-                        } else if (duration.count() < 1000000) {
-                            std::cout << " (" << std::fixed << std::setprecision(2)
-                                      << (duration.count() / 1000.0) << " ms)";
-                        } else {
-                            std::cout << " (" << std::fixed << std::setprecision(2)
-                                      << (duration.count() / 1000000.0) << " s)";
-                        }
-                    }
-                    std::cout << "\n";
-                }
+            if (trimlow == ".quit" || trimlow == ".exit" || trimlow == ".q") {
+                std::cout << "Bye!\n"; break;
             }
-        } catch (const std::exception& e) {
-            std::cout << "Error: " << e.what() << "\n";
+            if (trimlow == ".help" || trimlow == ".h") {
+                PrintHelp(alias); continue;
+            }
+            if (trimlow == ".tables") {
+                auto r = conn.Query(
+                    "SELECT table_name FROM duckd_query('" + url + "',"
+                    " 'SELECT table_name FROM information_schema.tables"
+                    "  WHERE table_schema = ''main'' ORDER BY table_name')");
+                if (!r->HasError()) PrintResult(*r);
+                else std::cerr << "Error: " << r->GetError() << "\n";
+                continue;
+            }
+            if (Trim(line).substr(0, 7) == ".schema") {
+                std::string tbl = Trim(line.substr(7));
+                if (tbl.empty()) {
+                    std::cerr << "Usage: .schema TABLENAME\n";
+                } else {
+                    auto r = conn.Query(
+                        "SELECT column_name, data_type, is_nullable"
+                        " FROM duckd_query('" + url + "',"
+                        " 'SELECT column_name, data_type, is_nullable"
+                        "  FROM information_schema.columns"
+                        "  WHERE table_name = ''" + tbl + "''"
+                        "  ORDER BY ordinal_position')");
+                    if (!r->HasError()) PrintResult(*r);
+                    else std::cerr << "Error: " << r->GetError() << "\n";
+                }
+                continue;
+            }
         }
 
-        query_buffer.clear();
+        buf += (multiline ? "\n" : "") + line;
+
+        if (Trim(buf).back() != ';') { multiline = true; continue; }
+        multiline = false;
+
+        auto r = conn.Query(buf);
+        PrintResult(*r);
+        buf.clear();
     }
 
-    // Cleanup
-    if (state.connected) {
-        state.client->Disconnect();
-    }
-
+    conn.Query("DETACH " + alias);
     return 0;
+#endif
 }

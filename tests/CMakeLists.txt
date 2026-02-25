@@ -171,31 +171,10 @@ target_link_libraries(test_pg_integration
 target_compile_features(test_pg_integration PUBLIC cxx_std_17)
 add_test(NAME test_pg_integration COMMAND test_pg_integration)
 
-#===----------------------------------------------------------------------===//
-# Integration Tests - Remote Extension (existing)
-#===----------------------------------------------------------------------===//
-
-add_executable(test_duckd_remote ${CMAKE_SOURCE_DIR}/tests/integration/test_extension.cpp)
-
-target_include_directories(test_duckd_remote
-    PRIVATE
-        ${DUCKDB_INCLUDE_DIRS}
-        ${CMAKE_SOURCE_DIR}/src/client/remote-client
-)
-
-target_link_libraries(test_duckd_remote
-    PRIVATE
-        duckd_client
-        duckdb_main_extension
-        core_functions_extension
-        parquet_extension
-        duckdb_generated_extension_loader
-)
-
-target_compile_features(test_duckd_remote PUBLIC cxx_std_17)
-
-# Disabled: native protocol test requires running server
-# add_test(NAME test_duckd_remote COMMAND test_duckd_remote)
+# Note: test_duckd_remote (DUCK binary protocol) has been removed.
+# The DUCK binary protocol client (remote-client/) was dead code — the server
+# never implemented the corresponding handler.  The Arrow Flight SQL path
+# (test_duckd_client) supersedes it.
 
 #===----------------------------------------------------------------------===//
 # Custom test target: run all PG protocol tests
@@ -238,9 +217,36 @@ if(WITH_FLIGHT_SQL)
     target_compile_features(test_flight_sql PUBLIC cxx_std_17)
     add_test(NAME test_flight_sql COMMAND test_flight_sql)
 
+    #===------------------------------------------------------------------===//
+    # Integration Tests - duckd_client extension (DuckDB SDK access)
+    #===------------------------------------------------------------------===//
+
+    add_executable(test_duckd_client
+        ${CMAKE_SOURCE_DIR}/tests/integration/flight/test_duckd_client.cpp
+    )
+    target_include_directories(test_duckd_client
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/src/client/duckd-client
+            ${DUCKDB_INCLUDE_DIRS}
+            ${CMAKE_SOURCE_DIR}/contrib/arrow/cpp/src
+            ${CMAKE_BINARY_DIR}/contrib/arrow-cmake/arrow/src
+    )
+    target_link_libraries(test_duckd_client
+        PRIVATE
+            ${DUCKD_TEST_LIBS}
+            duckd_flight_client_static
+            arrow_flight_sql_static
+            arrow_flight_static
+            arrow_static
+            "${ARROW_BUNDLED_DEPS_LIB}"
+    )
+    target_compile_features(test_duckd_client PUBLIC cxx_std_17)
+    add_test(NAME test_duckd_client COMMAND test_duckd_client)
+
     add_custom_target(test_flight
         COMMAND ${CMAKE_CTEST_COMMAND} -R "test_flight" --output-on-failure
-        DEPENDS test_flight_sql
+        DEPENDS test_flight_sql test_duckd_client
         COMMENT "Running Flight SQL tests"
     )
 endif()
