@@ -36,6 +36,10 @@
 #include "duckdb/storage/database_size.hpp"
 
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/physical_operator_states.hpp"
+#include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/parallel/event.hpp"
 
 #include <arrow/api.h>
 #include <arrow/type.h>
@@ -387,6 +391,119 @@ static string FilterToSQL(const TableFilter &filter, const string &col_name) {
             return ""; // unsupported — skip this filter
     }
 }
+
+//===----------------------------------------------------------------------===//
+// PhysicalDuckdInsert – physical operator that forwards INSERT to remote duckd
+//
+// Implements the sink+source pattern used by DuckDB DML operators:
+//   Sink()     – accumulates input DataChunks as SQL VALUES text
+//   Finalize() – sends INSERT SQL to the remote server via ExecuteUpdate()
+//   GetData()  – returns a single-row chunk with the affected row count
+//===----------------------------------------------------------------------===//
+
+struct DuckdInsertSinkState : public GlobalSinkState {
+    string        sql_values;     // accumulated "(v1, v2), ..." text
+    int64_t       affected_rows = 0;
+    std::mutex    mtx;
+};
+
+struct DuckdInsertSourceState : public GlobalSourceState {
+    bool returned = false;
+};
+
+class PhysicalDuckdInsert : public PhysicalOperator {
+public:
+    PhysicalDuckdInsert(PhysicalPlan &plan, LogicalOperator &op,
+                        string schema_name, string table_name,
+                        vector<string> column_names,
+                        std::shared_ptr<duckdb_client::DuckdFlightClient> client)
+        : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION,
+                           {LogicalType::BIGINT}, op.estimated_cardinality)
+        , schema_name_(std::move(schema_name))
+        , table_name_(std::move(table_name))
+        , column_names_(std::move(column_names))
+        , client_(std::move(client)) {}
+
+    bool IsSink()   const override { return true;  }
+    bool IsSource() const override { return true;  }
+
+    // ── Sink interface ──────────────────────────────────────────────────────
+
+    unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
+        return make_uniq<DuckdInsertSinkState>();
+    }
+
+    SinkResultType Sink(ExecutionContext &ctx, DataChunk &chunk,
+                        OperatorSinkInput &input) const override {
+        if (chunk.size() == 0) {
+            return SinkResultType::NEED_MORE_INPUT;
+        }
+        auto &gstate = input.global_state.Cast<DuckdInsertSinkState>();
+        std::lock_guard<std::mutex> lock(gstate.mtx);
+
+        for (idx_t row = 0; row < chunk.size(); row++) {
+            if (!gstate.sql_values.empty()) {
+                gstate.sql_values += ", ";
+            }
+            gstate.sql_values += "(";
+            for (idx_t col = 0; col < column_names_.size() && col < chunk.data.size(); col++) {
+                if (col > 0) {
+                    gstate.sql_values += ", ";
+                }
+                gstate.sql_values += ValueToSQLLiteral(chunk.data[col].GetValue(row));
+            }
+            gstate.sql_values += ")";
+        }
+        return SinkResultType::NEED_MORE_INPUT;
+    }
+
+    SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &,
+                              OperatorSinkFinalizeInput &input) const override {
+        auto &gstate = input.global_state.Cast<DuckdInsertSinkState>();
+        if (gstate.sql_values.empty()) {
+            return SinkFinalizeType::READY; // nothing to insert
+        }
+
+        string sql = "INSERT INTO " + schema_name_ + "." + table_name_ + " (";
+        for (size_t i = 0; i < column_names_.size(); i++) {
+            if (i > 0) sql += ", ";
+            sql += column_names_[i];
+        }
+        sql += ") VALUES " + gstate.sql_values;
+
+        auto result = client_->ExecuteUpdate(sql);
+        if (!result.ok()) {
+            throw IOException("duckd: INSERT failed: " + result.status().ToString());
+        }
+        gstate.affected_rows = result.ValueUnsafe();
+        return SinkFinalizeType::READY;
+    }
+
+    // ── Source interface ────────────────────────────────────────────────────
+
+    unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+        return make_uniq<DuckdInsertSourceState>();
+    }
+
+    SourceResultType GetDataInternal(ExecutionContext &, DataChunk &chunk,
+                                     OperatorSourceInput &input) const override {
+        auto &src_state = input.global_state.Cast<DuckdInsertSourceState>();
+        if (src_state.returned) {
+            return SourceResultType::FINISHED;
+        }
+        src_state.returned = true;
+        auto &gstate = sink_state->Cast<DuckdInsertSinkState>();
+        chunk.SetCardinality(1);
+        chunk.SetValue(0, 0, Value::BIGINT(gstate.affected_rows));
+        return SourceResultType::FINISHED;
+    }
+
+private:
+    string                                              schema_name_;
+    string                                              table_name_;
+    vector<string>                                      column_names_;
+    std::shared_ptr<duckdb_client::DuckdFlightClient>   client_;
+};
 
 //===----------------------------------------------------------------------===//
 // DuckdTransactionManager
@@ -985,11 +1102,34 @@ PhysicalOperator &DuckdCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanG
         "Use duckd_exec(url, 'CREATE TABLE AS SELECT ...') instead.");
 }
 
-PhysicalOperator &DuckdCatalog::PlanInsert(ClientContext &, PhysicalPlanGenerator &,
-                                            LogicalInsert &, optional_ptr<PhysicalOperator>) {
-    throw NotImplementedException(
-        "duckd: INSERT via the remote catalog is not supported. "
-        "Use duckd_exec(url, 'INSERT INTO ...') for DML operations.");
+PhysicalOperator &DuckdCatalog::PlanInsert(ClientContext &ctx, PhysicalPlanGenerator &planner,
+                                            LogicalInsert &op,
+                                            optional_ptr<PhysicalOperator> plan) {
+    if (!plan) {
+        throw NotImplementedException(
+            "duckd: INSERT without a child plan is not supported");
+    }
+
+    // Apply default-value and column-ordering projection when columns are
+    // specified in non-canonical order (INSERT INTO t (c2, c1) VALUES ...).
+    if (!op.column_index_map.empty()) {
+        plan = planner.ResolveDefaultsProjection(op, *plan);
+    }
+
+    auto &duck_table = op.table.Cast<DuckdTableEntry>();
+    string schema_name = duck_table.schema.name;
+    string table_name  = duck_table.name;
+
+    // Collect physical column names in table-definition order
+    vector<string> col_names;
+    for (auto &col : duck_table.GetColumns().Physical()) {
+        col_names.push_back(col.Name());
+    }
+
+    auto &insert_op = planner.Make<PhysicalDuckdInsert>(
+        op, schema_name, table_name, std::move(col_names), client_);
+    insert_op.children.push_back(*plan);
+    return insert_op;
 }
 
 PhysicalOperator &DuckdCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &,

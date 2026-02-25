@@ -723,6 +723,111 @@ static int TestErrorHandling(DuckdClientTest &t) {
 }
 
 //===----------------------------------------------------------------------===//
+// Tests: DML forwarding via ATTACH catalog (P4)
+//
+// Verifies that INSERT INTO remote.main.t VALUES (...) is forwarded to the
+// remote server via PhysicalDuckdInsert without requiring duckd_exec().
+//===----------------------------------------------------------------------===//
+
+static int TestDMLForwarding(DuckdClientTest &t) {
+    int passed = 0, failed = 0;
+
+    // Attach the remote catalog
+    auto ar = t.conn().Query(
+        "ATTACH '" + t.url() + "' AS dml_cat (TYPE duckd)");
+    if (ar->HasError()) {
+        TEST_FAIL("ATTACH: " + ar->GetError());
+        return failed;
+    }
+
+    TEST_BEGIN("INSERT via catalog: CREATE target table");
+    {
+        auto r = t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'CREATE TABLE dml_target (id INTEGER, val VARCHAR)')");
+        if (r->HasError()) { TEST_FAIL(r->GetError()); }
+        else { TEST_PASS(); }
+    }
+
+    TEST_BEGIN("INSERT via catalog: INSERT INTO dml_cat.main.dml_target VALUES");
+    {
+        auto r = t.conn().Query(
+            "INSERT INTO dml_cat.main.dml_target VALUES"
+            " (1, 'alpha'), (2, 'beta'), (3, 'gamma')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    TEST_BEGIN("INSERT via catalog: verify 3 rows on server");
+    {
+        auto r = t.conn().Query(
+            "SELECT COUNT(*) AS cnt FROM dml_cat.main.dml_target");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto cnt = r->GetValue(0, 0).GetValue<int64_t>();
+            if (cnt != 3) {
+                TEST_FAIL("expected 3 rows, got " + std::to_string(cnt));
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    TEST_BEGIN("INSERT via catalog: INSERT INTO ... SELECT from local table");
+    {
+        // Insert 5 extra rows via a local generate_series → remote table
+        auto r = t.conn().Query(
+            "INSERT INTO dml_cat.main.dml_target"
+            " SELECT i, 'row_' || CAST(i AS VARCHAR)"
+            " FROM generate_series(10, 14) t(i)");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            // Verify total is now 8
+            auto vr = t.conn().Query(
+                "SELECT COUNT(*) AS cnt FROM dml_cat.main.dml_target");
+            if (vr->HasError() || vr->GetValue(0, 0).GetValue<int64_t>() != 8) {
+                TEST_FAIL("expected 8 rows after second INSERT");
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    TEST_BEGIN("INSERT via catalog: values round-trip correctly");
+    {
+        auto r = t.conn().Query(
+            "SELECT id, val FROM dml_cat.main.dml_target"
+            " WHERE id = 2 ORDER BY id");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 1) {
+            TEST_FAIL("expected 1 row for id=2");
+        } else {
+            auto id  = r->GetValue(0, 0).GetValue<int32_t>();
+            auto val = r->GetValue(1, 0).ToString();
+            if (id != 2 || val != "beta") {
+                TEST_FAIL("wrong values: id=" + std::to_string(id) + " val=" + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // Cleanup
+    t.conn().Query("DETACH dml_cat");
+    t.conn().Query(
+        "SELECT duckd_exec('" + t.url() + "',"
+        " 'DROP TABLE IF EXISTS dml_target')");
+
+    return failed;
+}
+
+//===----------------------------------------------------------------------===//
 // Tests: streaming scan via ATTACH catalog (P1+P2)
 //
 // Verifies that the streaming scan correctly handles multi-batch result sets
@@ -960,6 +1065,12 @@ int main() {
         std::cout << "\n--- Concurrency Tests ---" << std::endl;
         DuckdClientTest t;
         total_failures += TestConcurrency(t);
+    }
+
+    {
+        std::cout << "\n--- DML Forwarding Tests (P4) ---" << std::endl;
+        DuckdClientTest t;
+        total_failures += TestDMLForwarding(t);
     }
 
     {
