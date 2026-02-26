@@ -24,7 +24,12 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/optimizer/optimizer_extension.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
+#include "duckdb/planner/bound_result_modifier.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_limit.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "duckdb/transaction/duck_transaction_manager.hpp"
 
@@ -230,6 +235,76 @@ static void DuckdQueryTableFunction(ClientContext &ctx, TableFunctionInput &inpu
 }
 
 //===----------------------------------------------------------------------===//
+// LIMIT pushdown optimizer extension
+//
+// Walks the logical plan and, when a LogicalLimit with a constant limit (and
+// no offset) directly wraps a duckd_scan LogicalGet — possibly via one
+// LogicalProjection after the LimitPushdown optimizer has run — stores the
+// limit value in DuckdScanBindData.  DuckdScanInitGlobal then appends
+// "LIMIT N" to the SQL sent to the remote server.
+//
+// Pattern 1 (no DuckDB LimitPushdown yet, or limit >= 8192):
+//   LIMIT(N) → GET(duckd_scan)
+//   LIMIT(N) → PROJECTION → GET(duckd_scan)
+//
+// Pattern 2 (after DuckDB LimitPushdown, limit < 8192):
+//   PROJECTION → LIMIT(N) → GET(duckd_scan)
+//===----------------------------------------------------------------------===//
+
+// Returns the LogicalGet if it is a duckd_scan, looking through one optional
+// LogicalProjection.
+static LogicalGet *FindDuckdScan(LogicalOperator &op) {
+    if (op.type == LogicalOperatorType::LOGICAL_GET) {
+        auto &get = op.Cast<LogicalGet>();
+        if (get.function.name == "duckd_scan") {
+            return &get;
+        }
+        return nullptr;
+    }
+    if (op.type == LogicalOperatorType::LOGICAL_PROJECTION &&
+        !op.children.empty()) {
+        return FindDuckdScan(*op.children[0]);
+    }
+    return nullptr;
+}
+
+static void DuckdLimitPushdownWalk(LogicalOperator &op) {
+    if (op.type == LogicalOperatorType::LOGICAL_LIMIT && !op.children.empty()) {
+        auto &limit = op.Cast<LogicalLimit>();
+        // Only push a constant, non-percentage LIMIT with no offset (or zero
+        // constant offset — e.g. OFFSET 0 is legal but rare).
+        bool offset_zero =
+            limit.offset_val.Type() == LimitNodeType::UNSET ||
+            (limit.offset_val.Type() == LimitNodeType::CONSTANT_VALUE &&
+             limit.offset_val.GetConstantValue() == 0);
+
+        if (limit.limit_val.Type() == LimitNodeType::CONSTANT_VALUE &&
+            offset_zero) {
+            idx_t n   = limit.limit_val.GetConstantValue();
+            auto *get = FindDuckdScan(*op.children[0]);
+            if (get && get->bind_data) {
+                auto &bd = get->bind_data->Cast<DuckdScanBindData>();
+                // Keep the tightest limit if multiple LIMIT nodes nest.
+                if (bd.limit_val == 0 || n < bd.limit_val) {
+                    bd.limit_val = n;
+                }
+            }
+        }
+    }
+
+    for (auto &child : op.children) {
+        DuckdLimitPushdownWalk(*child);
+    }
+}
+
+static void DuckdLimitPushdownOptimize(OptimizerExtensionInput & /*input*/,
+                                        unique_ptr<LogicalOperator> &plan) {
+    if (plan) {
+        DuckdLimitPushdownWalk(*plan);
+    }
+}
+
+//===----------------------------------------------------------------------===//
 // Extension Load / Init
 //===----------------------------------------------------------------------===//
 
@@ -242,6 +317,12 @@ public:
         storage_ext->create_transaction_manager = DuckdCreateTransactionManager;
         StorageExtension::Register(loader.GetDatabaseInstance().config,
                                    "duckd", storage_ext);
+
+        // Register LIMIT pushdown optimizer for duckd_scan table functions.
+        OptimizerExtension limit_ext;
+        limit_ext.optimize_function = DuckdLimitPushdownOptimize;
+        OptimizerExtension::Register(loader.GetDatabaseInstance().config,
+                                     std::move(limit_ext));
 
         // duckd_exec(url VARCHAR, sql VARCHAR) → BIGINT
         ScalarFunction exec_fn(

@@ -1566,6 +1566,122 @@ static int TestYellowFixes(DuckdClientTest &t) {
 }
 
 //===----------------------------------------------------------------------===//
+// LIMIT Pushdown Tests (3.5)
+//===----------------------------------------------------------------------===//
+
+static int TestLimitPushdown(DuckdClientTest &t) {
+    int passed = 0, failed = 0;
+
+    // Setup: a table with 1000 rows on the server.
+    t.conn().Query("SELECT duckd_exec('" + t.url() + "',"
+                   " 'DROP TABLE IF EXISTS lp_series')");
+    t.conn().Query("SELECT duckd_exec('" + t.url() + "',"
+                   " 'CREATE TABLE lp_series AS "
+                   "  SELECT i, i*2 AS double_i"
+                   "  FROM generate_series(1, 1000) t(i)')");
+    auto ar = t.conn().Query("ATTACH '" + t.url() + "' AS lp_cat (TYPE duckd)");
+    if (ar->HasError()) {
+        std::cout << "[SKIP] LIMIT pushdown tests: ATTACH failed: "
+                  << ar->GetError() << std::endl;
+        return 0;
+    }
+
+    // ── 3.5a: LIMIT on catalog table returns correct row count ────────────
+    TEST_BEGIN("fix 3.5a: SELECT ... LIMIT N returns exactly N rows");
+    {
+        auto r = t.conn().Query(
+            "SELECT i FROM lp_cat.main.lp_series LIMIT 10");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 10) {
+            TEST_FAIL("expected 10 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    // ── 3.5b: LIMIT + WHERE combination ───────────────────────────────────
+    TEST_BEGIN("fix 3.5b: LIMIT N with WHERE pushdown returns correct rows");
+    {
+        // The server should execute: SELECT i, double_i FROM lp_series
+        //   WHERE i > 500 LIMIT 5
+        // Correctness check: every returned i > 500.
+        auto r = t.conn().Query(
+            "SELECT i FROM lp_cat.main.lp_series WHERE i > 500 LIMIT 5");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 5) {
+            TEST_FAIL("expected 5 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            bool all_gt_500 = true;
+            for (idx_t row = 0; row < r->RowCount(); row++) {
+                if (r->GetValue(0, row).GetValue<int64_t>() <= 500) {
+                    all_gt_500 = false;
+                }
+            }
+            if (!all_gt_500) {
+                TEST_FAIL("returned row with i <= 500 despite WHERE i > 500");
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ── 3.5c: LIMIT 0 edge case — no rows returned ────────────────────────
+    TEST_BEGIN("fix 3.5c: LIMIT 0 returns zero rows");
+    {
+        auto r = t.conn().Query(
+            "SELECT i FROM lp_cat.main.lp_series LIMIT 0");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 0) {
+            TEST_FAIL("expected 0 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    // ── 3.5d: LIMIT > table size — full table returned ────────────────────
+    TEST_BEGIN("fix 3.5d: LIMIT larger than table returns all rows");
+    {
+        auto r = t.conn().Query(
+            "SELECT i FROM lp_cat.main.lp_series LIMIT 9999");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 1000) {
+            TEST_FAIL("expected 1000 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    // ── 3.5e: LIMIT with ORDER BY (correctness, not pushdown) ─────────────
+    TEST_BEGIN("fix 3.5e: ORDER BY + LIMIT returns correct top-N");
+    {
+        auto r = t.conn().Query(
+            "SELECT i FROM lp_cat.main.lp_series ORDER BY i DESC LIMIT 3");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 3) {
+            TEST_FAIL("expected 3 rows, got " + std::to_string(r->RowCount()));
+        } else if (r->GetValue(0, 0).GetValue<int64_t>() != 1000) {
+            TEST_FAIL("expected first row i=1000 (ORDER BY DESC), got " +
+                       r->GetValue(0, 0).ToString());
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    t.conn().Query("DETACH lp_cat");
+    t.conn().Query("SELECT duckd_exec('" + t.url() + "',"
+                   " 'DROP TABLE IF EXISTS lp_series')");
+
+    std::cout << "  LIMIT pushdown: " << passed << " passed, "
+              << failed << " failed" << std::endl;
+    return failed;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -1651,6 +1767,12 @@ int main() {
         std::cout << "\n--- Yellow-Priority Fix Tests (1.5/3.1/3.2/3.3) ---" << std::endl;
         DuckdClientTest t;
         total_failures += TestYellowFixes(t);
+    }
+
+    {
+        std::cout << "\n--- LIMIT Pushdown Tests (3.5) ---" << std::endl;
+        DuckdClientTest t;
+        total_failures += TestLimitPushdown(t);
     }
 
     std::cout << "\n=== Summary ===" << std::endl;

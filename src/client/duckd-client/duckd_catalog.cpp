@@ -780,6 +780,9 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
     if (!conditions.empty()) {
         sql += " WHERE " + StringUtil::Join(conditions, " AND ");
     }
+    if (bd.limit_val > 0) {
+        sql += " LIMIT " + to_string(bd.limit_val);
+    }
 
     // Open a streaming scan — data is pulled batch-by-batch in DuckdScanFunction.
     // If we are inside a Flight SQL transaction, run the query within it.

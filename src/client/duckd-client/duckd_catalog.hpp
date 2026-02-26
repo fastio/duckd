@@ -85,6 +85,11 @@ struct DuckdScanBindData : public TableFunctionData {
     vector<LogicalType> column_types; // all column types (parallel to column_names)
     std::shared_ptr<duckdb_client::DuckdFlightClient> client;
     Catalog *catalog = nullptr;       // non-owning; for active-transaction lookup
+
+    // LIMIT pushdown: if > 0, DuckdScanInitGlobal appends "LIMIT N" to the SQL.
+    // Set by the DuckdLimitPushdown optimizer extension when a constant LIMIT
+    // (with no offset) wraps this scan in the logical plan.
+    idx_t limit_val = 0;
 };
 
 class DuckdTableEntry : public TableCatalogEntry {
