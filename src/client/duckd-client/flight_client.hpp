@@ -98,6 +98,27 @@ public:
     // Get the Arrow schema for a query without fetching any data.
     arrow::Result<std::shared_ptr<arrow::Schema>> GetQuerySchema(const std::string& sql);
 
+    //===------------------------------------------------------------------===//
+    // Flight SQL transaction support
+    //===------------------------------------------------------------------===//
+
+    // Begin a server-side transaction; returns an opaque transaction handle.
+    arrow::Result<flightsql::Transaction> BeginTransaction();
+
+    // Commit an open transaction.
+    arrow::Status CommitTransaction(const flightsql::Transaction& txn);
+
+    // Rollback an open transaction.
+    arrow::Status RollbackTransaction(const flightsql::Transaction& txn);
+
+    // Execute a streaming SELECT within an existing transaction.
+    arrow::Result<std::unique_ptr<DuckdQueryStream>> ExecuteQueryStream(
+        const std::string& sql, const flightsql::Transaction& txn);
+
+    // Execute a DML/DDL statement within an existing transaction.
+    arrow::Result<int64_t> ExecuteUpdate(
+        const std::string& sql, const flightsql::Transaction& txn);
+
 private:
     DuckdFlightClient() = default;
 

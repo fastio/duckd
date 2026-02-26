@@ -39,8 +39,12 @@ public:
     bool IsRunning() const { return running_; }
 
     //===------------------------------------------------------------------===//
-    // Statement execution
+    // Statement execution (SELECT)
     //===------------------------------------------------------------------===//
+
+    arrow::Result<int64_t> DoPutCommandStatementUpdate(
+        const flight::ServerCallContext& context,
+        const flightsql::StatementUpdate& command) override;
 
     arrow::Result<std::unique_ptr<flight::FlightInfo>> GetFlightInfoStatement(
         const flight::ServerCallContext& context,
@@ -77,6 +81,18 @@ public:
         const flightsql::PreparedStatementQuery& command,
         flight::FlightMessageReader* reader,
         flight::FlightMetadataWriter* writer) override;
+
+    //===------------------------------------------------------------------===//
+    // Transactions
+    //===------------------------------------------------------------------===//
+
+    arrow::Result<flightsql::ActionBeginTransactionResult> BeginTransaction(
+        const flight::ServerCallContext& context,
+        const flightsql::ActionBeginTransactionRequest& request) override;
+
+    arrow::Status EndTransaction(
+        const flight::ServerCallContext& context,
+        const flightsql::ActionEndTransactionRequest& request) override;
 
     //===------------------------------------------------------------------===//
     // Catalog / metadata
@@ -155,12 +171,22 @@ private:
         std::string query;                  // SQL query, or prepared statement handle if is_prepared
         std::shared_ptr<arrow::Schema> schema;
         bool is_prepared = false;           // true if query holds a prepared statement handle
+        std::string transaction_id;         // non-empty if within a Flight SQL transaction
+    };
+
+    // Open Flight SQL transactions by handle
+    // The connection has already begun a DuckDB transaction.
+    struct TransactionEntry {
+        std::shared_ptr<duckdb::Connection> connection;
     };
 
     std::string GenerateHandle();
 
+    // Retrieve the shared connection for a transaction, or nullptr for auto-commit
+    std::shared_ptr<duckdb::Connection> GetTransactionConnection(
+        const std::string& transaction_id);
+
     SessionManager* session_manager_;
-    ExecutorPool* executor_pool_;
     std::string host_;
     uint16_t port_;
     std::atomic<bool> running_{false};
@@ -173,6 +199,10 @@ private:
     // Transient queries by handle (GetFlightInfoStatement → DoGetStatement)
     std::mutex query_mutex_;
     std::unordered_map<std::string, TransientQuery> transient_queries_;
+
+    // Open transactions by handle
+    std::mutex txn_mutex_;
+    std::unordered_map<std::string, TransactionEntry> open_transactions_;
 
     // Handle counter
     std::atomic<uint64_t> handle_counter_{0};

@@ -49,8 +49,9 @@ static unique_ptr<Catalog> DuckdAttach(optional_ptr<StorageExtensionInfo> /*stor
 
 static unique_ptr<TransactionManager>
 DuckdCreateTransactionManager(optional_ptr<StorageExtensionInfo> /*storage_info*/,
-                               AttachedDatabase &db, Catalog & /*catalog*/) {
-    return make_uniq<DuckdTransactionManager>(db);
+                               AttachedDatabase &db, Catalog &catalog_ref) {
+    auto &duck_catalog = catalog_ref.Cast<DuckdCatalog>();
+    return make_uniq<DuckdTransactionManager>(db, duck_catalog.GetSharedClient());
 }
 
 //===----------------------------------------------------------------------===//

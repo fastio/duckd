@@ -163,6 +163,47 @@ arrow::Result<std::shared_ptr<arrow::Schema>> DuckdFlightClient::GetQuerySchema(
 }
 
 //===----------------------------------------------------------------------===//
+// Transaction management
+//===----------------------------------------------------------------------===//
+
+arrow::Result<flightsql::Transaction> DuckdFlightClient::BeginTransaction() {
+    return client_->BeginTransaction(call_options_);
+}
+
+arrow::Status DuckdFlightClient::CommitTransaction(const flightsql::Transaction& txn) {
+    return client_->Commit(call_options_, txn);
+}
+
+arrow::Status DuckdFlightClient::RollbackTransaction(const flightsql::Transaction& txn) {
+    return client_->Rollback(call_options_, txn);
+}
+
+arrow::Result<std::unique_ptr<DuckdQueryStream>>
+DuckdFlightClient::ExecuteQueryStream(const std::string& sql,
+                                      const flightsql::Transaction& txn) {
+    ARROW_ASSIGN_OR_RAISE(auto info, client_->Execute(call_options_, sql, txn));
+
+    auto stream = std::unique_ptr<DuckdQueryStream>(new DuckdQueryStream());
+    stream->endpoints_    = info->endpoints();
+    stream->sql_client_   = client_.get();
+    stream->call_options_ = call_options_;
+
+    if (!stream->endpoints_.empty()) {
+        ARROW_ASSIGN_OR_RAISE(stream->current_stream_,
+            client_->DoGet(call_options_, stream->endpoints_[0].ticket));
+        stream->ep_idx_ = 1;
+        ARROW_ASSIGN_OR_RAISE(stream->schema_, stream->current_stream_->GetSchema());
+    }
+
+    return std::move(stream);
+}
+
+arrow::Result<int64_t> DuckdFlightClient::ExecuteUpdate(const std::string& sql,
+                                                         const flightsql::Transaction& txn) {
+    return client_->ExecuteUpdate(call_options_, sql, txn);
+}
+
+//===----------------------------------------------------------------------===//
 // DuckdClientRegistry
 //===----------------------------------------------------------------------===//
 

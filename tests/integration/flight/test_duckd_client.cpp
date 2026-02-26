@@ -1016,6 +1016,183 @@ static int TestConcurrency(DuckdClientTest &t) {
 }
 
 //===----------------------------------------------------------------------===//
+// Tests: Flight SQL transaction propagation (P5)
+//
+// Verifies that explicit DuckDB transactions (BEGIN/COMMIT/ROLLBACK) are
+// forwarded to the remote server so that:
+//   - rows inserted within a rolled-back transaction are invisible afterwards
+//   - rows inserted within a committed transaction are durable
+//===----------------------------------------------------------------------===//
+
+static int TestTransactionPropagation(DuckdClientTest &t) {
+    int passed = 0, failed = 0;
+
+    // Create the target table on the server and attach the remote catalog.
+    t.conn().Query(
+        "SELECT duckd_exec('" + t.url() + "',"
+        " 'CREATE TABLE txn_test (id INTEGER, val VARCHAR)')");
+
+    auto ar = t.conn().Query(
+        "ATTACH '" + t.url() + "' AS txn_cat (TYPE duckd)");
+    if (ar->HasError()) {
+        TEST_FAIL("ATTACH: " + ar->GetError());
+        return failed;
+    }
+
+    // ── Test 1: ROLLBACK undoes the INSERT ───────────────────────────────────
+    TEST_BEGIN("transaction: ROLLBACK discards inserted rows");
+    {
+        bool ok = true;
+        std::string err;
+
+        // BEGIN + INSERT
+        auto r1 = t.conn().Query("BEGIN");
+        if (r1->HasError()) { ok = false; err = "BEGIN: " + r1->GetError(); }
+
+        if (ok) {
+            auto r2 = t.conn().Query(
+                "INSERT INTO txn_cat.main.txn_test VALUES (1, 'rollback_me')");
+            if (r2->HasError()) { ok = false; err = "INSERT: " + r2->GetError(); }
+        }
+
+        // Within the transaction the row must be visible via the catalog scan
+        if (ok) {
+            auto r3 = t.conn().Query(
+                "SELECT COUNT(*) AS cnt FROM txn_cat.main.txn_test WHERE id = 1");
+            if (r3->HasError()) {
+                ok = false; err = "SELECT within txn: " + r3->GetError();
+            } else {
+                auto cnt = r3->GetValue(0, 0).GetValue<int64_t>();
+                if (cnt != 1) {
+                    ok = false;
+                    err = "expected 1 row within txn, got " + std::to_string(cnt);
+                }
+            }
+        }
+
+        // ROLLBACK
+        if (ok) {
+            auto r4 = t.conn().Query("ROLLBACK");
+            if (r4->HasError()) { ok = false; err = "ROLLBACK: " + r4->GetError(); }
+        }
+
+        // After rollback the row must NOT be visible
+        if (ok) {
+            auto r5 = t.conn().Query(
+                "SELECT COUNT(*) AS cnt FROM txn_cat.main.txn_test WHERE id = 1");
+            if (r5->HasError()) {
+                ok = false; err = "SELECT after rollback: " + r5->GetError();
+            } else {
+                auto cnt = r5->GetValue(0, 0).GetValue<int64_t>();
+                if (cnt != 0) {
+                    ok = false;
+                    err = "expected 0 rows after rollback, got " + std::to_string(cnt);
+                }
+            }
+        }
+
+        if (!ok) { TEST_FAIL(err); } else { TEST_PASS(); }
+    }
+
+    // ── Test 2: COMMIT makes the INSERT durable ──────────────────────────────
+    TEST_BEGIN("transaction: COMMIT persists inserted rows");
+    {
+        bool ok = true;
+        std::string err;
+
+        // Ensure table is empty before this sub-test
+        t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'DELETE FROM txn_test')");
+
+        auto r1 = t.conn().Query("BEGIN");
+        if (r1->HasError()) { ok = false; err = "BEGIN: " + r1->GetError(); }
+
+        if (ok) {
+            auto r2 = t.conn().Query(
+                "INSERT INTO txn_cat.main.txn_test VALUES (2, 'commit_me')");
+            if (r2->HasError()) { ok = false; err = "INSERT: " + r2->GetError(); }
+        }
+
+        if (ok) {
+            auto r3 = t.conn().Query("COMMIT");
+            if (r3->HasError()) { ok = false; err = "COMMIT: " + r3->GetError(); }
+        }
+
+        // After commit the row must be visible in a new auto-commit query
+        if (ok) {
+            auto r4 = t.conn().Query(
+                "SELECT id, val FROM txn_cat.main.txn_test WHERE id = 2");
+            if (r4->HasError()) {
+                ok = false; err = "SELECT after commit: " + r4->GetError();
+            } else if (r4->RowCount() != 1) {
+                ok = false;
+                err = "expected 1 row after commit, got " +
+                      std::to_string(r4->RowCount());
+            } else {
+                auto val = r4->GetValue(1, 0).ToString();
+                if (val != "commit_me") {
+                    ok = false;
+                    err = "wrong value after commit: " + val;
+                }
+            }
+        }
+
+        if (!ok) { TEST_FAIL(err); } else { TEST_PASS(); }
+    }
+
+    // ── Test 3: Multi-statement transaction ──────────────────────────────────
+    TEST_BEGIN("transaction: multiple INSERTs then COMMIT");
+    {
+        bool ok = true;
+        std::string err;
+
+        t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'DELETE FROM txn_test')");
+
+        auto r1 = t.conn().Query("BEGIN");
+        if (r1->HasError()) { ok = false; err = "BEGIN: " + r1->GetError(); }
+
+        for (int i = 10; i <= 14 && ok; i++) {
+            auto ri = t.conn().Query(
+                "INSERT INTO txn_cat.main.txn_test VALUES (" +
+                std::to_string(i) + ", 'row" + std::to_string(i) + "')");
+            if (ri->HasError()) { ok = false; err = "INSERT " + std::to_string(i) + ": " + ri->GetError(); }
+        }
+
+        if (ok) {
+            auto rc = t.conn().Query("COMMIT");
+            if (rc->HasError()) { ok = false; err = "COMMIT: " + rc->GetError(); }
+        }
+
+        if (ok) {
+            auto rv = t.conn().Query(
+                "SELECT COUNT(*) AS cnt FROM txn_cat.main.txn_test");
+            if (rv->HasError()) {
+                ok = false; err = "COUNT: " + rv->GetError();
+            } else {
+                auto cnt = rv->GetValue(0, 0).GetValue<int64_t>();
+                if (cnt != 5) {
+                    ok = false;
+                    err = "expected 5 rows, got " + std::to_string(cnt);
+                }
+            }
+        }
+
+        if (!ok) { TEST_FAIL(err); } else { TEST_PASS(); }
+    }
+
+    // Cleanup
+    t.conn().Query("DETACH txn_cat");
+    t.conn().Query(
+        "SELECT duckd_exec('" + t.url() + "',"
+        " 'DROP TABLE IF EXISTS txn_test')");
+
+    return failed;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -1083,6 +1260,12 @@ int main() {
         std::cout << "\n--- Connection Registry Tests (P6) ---" << std::endl;
         DuckdClientTest t;
         total_failures += TestConnectionRegistry(t);
+    }
+
+    {
+        std::cout << "\n--- Transaction Propagation Tests (P5) ---" << std::endl;
+        DuckdClientTest t;
+        total_failures += TestTransactionPropagation(t);
     }
 
     std::cout << "\n=== Summary ===" << std::endl;

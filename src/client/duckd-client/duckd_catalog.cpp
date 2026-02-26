@@ -416,13 +416,15 @@ public:
     PhysicalDuckdInsert(PhysicalPlan &plan, LogicalOperator &op,
                         string schema_name, string table_name,
                         vector<string> column_names,
-                        std::shared_ptr<duckdb_client::DuckdFlightClient> client)
+                        std::shared_ptr<duckdb_client::DuckdFlightClient> client,
+                        Catalog &catalog)
         : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION,
                            {LogicalType::BIGINT}, op.estimated_cardinality)
         , schema_name_(std::move(schema_name))
         , table_name_(std::move(table_name))
         , column_names_(std::move(column_names))
-        , client_(std::move(client)) {}
+        , client_(std::move(client))
+        , catalog_(catalog) {}
 
     bool IsSink()   const override { return true;  }
     bool IsSource() const override { return true;  }
@@ -457,7 +459,7 @@ public:
         return SinkResultType::NEED_MORE_INPUT;
     }
 
-    SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &,
+    SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &ctx,
                               OperatorSinkFinalizeInput &input) const override {
         auto &gstate = input.global_state.Cast<DuckdInsertSinkState>();
         if (gstate.sql_values.empty()) {
@@ -471,7 +473,15 @@ public:
         }
         sql += ") VALUES " + gstate.sql_values;
 
-        auto result = client_->ExecuteUpdate(sql);
+        // Execute within the active transaction if one exists.
+        arrow::Result<int64_t> result;
+        auto &duckd_txn = Transaction::Get(ctx, catalog_).Cast<DuckdTransaction>();
+        if (duckd_txn.HasFlightTxn()) {
+            result = client_->ExecuteUpdate(sql, duckd_txn.FlightTxn());
+        } else {
+            result = client_->ExecuteUpdate(sql);
+        }
+
         if (!result.ok()) {
             throw IOException("duckd: INSERT failed: " + result.status().ToString());
         }
@@ -503,6 +513,7 @@ private:
     string                                              table_name_;
     vector<string>                                      column_names_;
     std::shared_ptr<duckdb_client::DuckdFlightClient>   client_;
+    Catalog                                            &catalog_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -510,8 +521,16 @@ private:
 //===----------------------------------------------------------------------===//
 
 Transaction &DuckdTransactionManager::StartTransaction(ClientContext &context) {
+    // Start a server-side Flight SQL transaction to back this DuckDB transaction.
+    auto txn_res = client_->BeginTransaction();
+    if (!txn_res.ok()) {
+        throw IOException("duckd: BeginTransaction failed: " +
+                          txn_res.status().ToString());
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
-    auto txn = make_uniq<DuckdTransaction>(*this, context);
+    auto txn = make_uniq<DuckdTransaction>(*this, context,
+                                            txn_res.MoveValueUnsafe());
     auto *ptr = txn.get();
     active_transactions_.push_back(std::move(txn));
     return *ptr;
@@ -519,6 +538,26 @@ Transaction &DuckdTransactionManager::StartTransaction(ClientContext &context) {
 
 ErrorData DuckdTransactionManager::CommitTransaction(ClientContext &context,
                                                       Transaction &transaction) {
+    auto &txn = transaction.Cast<DuckdTransaction>();
+
+    // Commit the server-side transaction before removing it from our list.
+    if (txn.HasFlightTxn()) {
+        auto status = client_->CommitTransaction(txn.FlightTxn());
+        if (!status.ok()) {
+            // Still remove from active list; return error to caller.
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = active_transactions_.begin();
+                 it != active_transactions_.end(); ++it) {
+                if (it->get() == &transaction) {
+                    active_transactions_.erase(it);
+                    break;
+                }
+            }
+            return ErrorData(IOException(
+                "duckd: COMMIT failed: " + status.ToString()));
+        }
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
         if (it->get() == &transaction) {
@@ -530,6 +569,13 @@ ErrorData DuckdTransactionManager::CommitTransaction(ClientContext &context,
 }
 
 void DuckdTransactionManager::RollbackTransaction(Transaction &transaction) {
+    auto &txn = transaction.Cast<DuckdTransaction>();
+
+    // Best-effort rollback; ignore errors (transaction may already be gone).
+    if (txn.HasFlightTxn()) {
+        (void)client_->RollbackTransaction(txn.FlightTxn());
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
         if (it->get() == &transaction) {
@@ -609,8 +655,20 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
         sql += " WHERE " + StringUtil::Join(conditions, " AND ");
     }
 
-    // Open a streaming scan — data is pulled batch-by-batch in DuckdScanFunction
-    auto stream_res = bd.client->ExecuteQueryStream(sql);
+    // Open a streaming scan — data is pulled batch-by-batch in DuckdScanFunction.
+    // If we are inside a Flight SQL transaction, run the query within it.
+    arrow::Result<std::unique_ptr<duckdb_client::DuckdQueryStream>> stream_res;
+    if (bd.catalog) {
+        auto &duckd_txn =
+            Transaction::Get(ctx, *bd.catalog).Cast<DuckdTransaction>();
+        if (duckd_txn.HasFlightTxn()) {
+            stream_res = bd.client->ExecuteQueryStream(sql, duckd_txn.FlightTxn());
+        } else {
+            stream_res = bd.client->ExecuteQueryStream(sql);
+        }
+    } else {
+        stream_res = bd.client->ExecuteQueryStream(sql);
+    }
     if (!stream_res.ok()) {
         throw IOException("duckd: scan failed: " + stream_res.status().ToString());
     }
@@ -720,6 +778,7 @@ TableFunction DuckdTableEntry::GetScanFunction(ClientContext &context,
     bd->schema_name  = schema_name_;
     bd->table_name   = name;
     bd->client       = client_;
+    bd->catalog      = &catalog; // for active-transaction lookup at scan time
 
     for (auto &col : columns.Physical()) {
         bd->column_names.push_back(col.Name());
@@ -1127,7 +1186,7 @@ PhysicalOperator &DuckdCatalog::PlanInsert(ClientContext &ctx, PhysicalPlanGener
     }
 
     auto &insert_op = planner.Make<PhysicalDuckdInsert>(
-        op, schema_name, table_name, std::move(col_names), client_);
+        op, schema_name, table_name, std::move(col_names), client_, *this);
     insert_op.children.push_back(*plan);
     return insert_op;
 }
