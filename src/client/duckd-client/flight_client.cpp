@@ -96,6 +96,7 @@ DuckdFlightClient::ExecuteQueryStream(const std::string& sql) {
     ARROW_ASSIGN_OR_RAISE(auto info, client_->Execute(call_options_, sql));
 
     auto stream = std::unique_ptr<DuckdQueryStream>(new DuckdQueryStream());
+    stream->client_owner_ = shared_from_this(); // keep *this alive for stream lifetime
     stream->endpoints_   = info->endpoints();
     stream->sql_client_  = client_.get();
     stream->call_options_ = call_options_;
@@ -186,6 +187,7 @@ DuckdFlightClient::ExecuteQueryStream(const std::string& sql,
     ARROW_ASSIGN_OR_RAISE(auto info, client_->Execute(call_options_, sql, txn));
 
     auto stream = std::unique_ptr<DuckdQueryStream>(new DuckdQueryStream());
+    stream->client_owner_ = shared_from_this(); // keep *this alive for stream lifetime
     stream->endpoints_    = info->endpoints();
     stream->sql_client_   = client_.get();
     stream->call_options_ = call_options_;

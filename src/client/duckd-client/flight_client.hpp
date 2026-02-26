@@ -42,6 +42,10 @@ struct DuckdQueryResult {
 // threaded since MaxThreads() returns 1).
 //===----------------------------------------------------------------------===//
 
+// Forward declaration: DuckdFlightClient is defined below; DuckdQueryStream
+// holds a shared_ptr to it as a lifetime anchor.
+class DuckdFlightClient;
+
 class DuckdQueryStream {
 public:
     DuckdQueryStream() = default;
@@ -62,6 +66,11 @@ public:
 private:
     friend class DuckdFlightClient;
 
+    // Keeps the owning DuckdFlightClient alive for the lifetime of this stream.
+    // Prevents use-after-free when DuckdClientRegistry::Evict() is called
+    // concurrently while a scan is iterating over a large result set.
+    std::shared_ptr<DuckdFlightClient>          client_owner_;
+
     std::unique_ptr<flight::FlightStreamReader> current_stream_;
     std::vector<flight::FlightEndpoint>         endpoints_;
     size_t                                      ep_idx_      = 0;
@@ -74,7 +83,7 @@ private:
 // DuckdFlightClient - thread-safe Arrow Flight SQL connection
 //===----------------------------------------------------------------------===//
 
-class DuckdFlightClient {
+class DuckdFlightClient : public std::enable_shared_from_this<DuckdFlightClient> {
 public:
     // Connect to a duckd server.  url must be grpc://host:port.
     static std::unique_ptr<DuckdFlightClient> Connect(const std::string& url);

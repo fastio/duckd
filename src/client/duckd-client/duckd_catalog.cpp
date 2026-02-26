@@ -670,7 +670,7 @@ Transaction &DuckdTransactionManager::StartTransaction(ClientContext &context) {
     auto txn = make_uniq<DuckdTransaction>(*this, context,
                                             txn_res.MoveValueUnsafe());
     auto *ptr = txn.get();
-    active_transactions_.push_back(std::move(txn));
+    active_transactions_[ptr] = std::move(txn);
     return *ptr;
 }
 
@@ -684,25 +684,14 @@ ErrorData DuckdTransactionManager::CommitTransaction(ClientContext &context,
         if (!status.ok()) {
             // Still remove from active list; return error to caller.
             std::lock_guard<std::mutex> lock(mutex_);
-            for (auto it = active_transactions_.begin();
-                 it != active_transactions_.end(); ++it) {
-                if (it->get() == &transaction) {
-                    active_transactions_.erase(it);
-                    break;
-                }
-            }
+            active_transactions_.erase(&transaction);
             return ErrorData(IOException(
                 "duckd: COMMIT failed: " + status.ToString()));
         }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
-        if (it->get() == &transaction) {
-            active_transactions_.erase(it);
-            break;
-        }
-    }
+    active_transactions_.erase(&transaction);
     return ErrorData();
 }
 
@@ -715,12 +704,7 @@ void DuckdTransactionManager::RollbackTransaction(Transaction &transaction) {
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
-    for (auto it = active_transactions_.begin(); it != active_transactions_.end(); ++it) {
-        if (it->get() == &transaction) {
-            active_transactions_.erase(it);
-            break;
-        }
-    }
+    active_transactions_.erase(&transaction);
 }
 
 //===----------------------------------------------------------------------===//
@@ -799,18 +783,17 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
 
     // Open a streaming scan — data is pulled batch-by-batch in DuckdScanFunction.
     // If we are inside a Flight SQL transaction, run the query within it.
-    arrow::Result<std::unique_ptr<duckdb_client::DuckdQueryStream>> stream_res;
+    const arrow::flight::sql::Transaction *flight_txn = nullptr;
     if (bd.catalog) {
         auto &duckd_txn =
             Transaction::Get(ctx, *bd.catalog).Cast<DuckdTransaction>();
         if (duckd_txn.HasFlightTxn()) {
-            stream_res = bd.client->ExecuteQueryStream(sql, duckd_txn.FlightTxn());
-        } else {
-            stream_res = bd.client->ExecuteQueryStream(sql);
+            flight_txn = &duckd_txn.FlightTxn();
         }
-    } else {
-        stream_res = bd.client->ExecuteQueryStream(sql);
     }
+    auto stream_res = flight_txn
+        ? bd.client->ExecuteQueryStream(sql, *flight_txn)
+        : bd.client->ExecuteQueryStream(sql);
     if (!stream_res.ok()) {
         throw IOException("duckd: scan failed: " + stream_res.status().ToString());
     }
@@ -1001,15 +984,39 @@ static unique_ptr<DuckdTableEntry> FetchTableEntry(
 optional_ptr<DuckdTableEntry> DuckdSchemaEntry::GetOrFetchTable(
     const string &table_name) {
 
-    std::lock_guard<std::mutex> lock(entry_mutex_);
+    // --- Fast path: cache hit (lock held briefly for read) ----------------
+    {
+        std::lock_guard<std::mutex> lk(entry_mutex_);
 
-    auto it = table_cache_.find(table_name);
-    if (it != table_cache_.end()) {
-        return *it->second;
+        // If the TTL has expired, evict the stale entry for this table so the
+        // slow path re-fetches it.  Full-cache invalidation happens on the
+        // next Scan() via PopulateTableCache().
+        if (cache_populated_) {
+            auto age = std::chrono::steady_clock::now() - cache_populated_at_;
+            if (age >= kTableCacheTTL) {
+                table_cache_.erase(table_name);
+            }
+        }
+
+        auto it = table_cache_.find(table_name);
+        if (it != table_cache_.end()) {
+            return *it->second;
+        }
     }
 
-    // Fetch from remote using the shared helper (does not re-acquire the lock)
+    // --- Slow path: RPC performed OUTSIDE the lock ------------------------
+    // Two threads may race here for the same table_name.  Both will call
+    // FetchTableEntry concurrently — the second writer is de-duplicated in
+    // the write phase below.
     auto entry = FetchTableEntry(catalog, *this, name, table_name, url_, client_);
+
+    // --- Write phase: acquire lock, double-check, insert ------------------
+    std::lock_guard<std::mutex> lk(entry_mutex_);
+    auto it = table_cache_.find(table_name);
+    if (it != table_cache_.end()) {
+        // Another thread already inserted an entry — use theirs.
+        return *it->second;
+    }
     if (!entry) {
         return nullptr;
     }
@@ -1045,12 +1052,18 @@ static LogicalType TypeFromInfoSchemaString(const string &data_type,
 }
 
 void DuckdSchemaEntry::PopulateTableCache() {
-    // Fast-path check: if already populated bail without any RPC.
-    // This double-check is intentional — we must NOT hold entry_mutex_ during
-    // the network call below so we re-check under the lock at the end.
+    // Fast-path check: if already populated and within TTL, skip the RPC.
+    // We must NOT hold entry_mutex_ during the network call below, so we
+    // re-check under the write lock at the end (double-check locking).
     {
         std::lock_guard<std::mutex> lk(entry_mutex_);
-        if (cache_populated_) return;
+        if (cache_populated_) {
+            auto age = std::chrono::steady_clock::now() - cache_populated_at_;
+            if (age < kTableCacheTTL) return;
+            // TTL expired — reset so the write phase repopulates the cache.
+            cache_populated_ = false;
+            table_cache_.clear();
+        }
     }
 
     // --- RPC phase: performed OUTSIDE any lock ----------------------------
@@ -1118,7 +1131,8 @@ void DuckdSchemaEntry::PopulateTableCache() {
     // --- Write phase: acquire lock, double-check, populate ----------------
     std::lock_guard<std::mutex> lk(entry_mutex_);
     if (cache_populated_) return; // another thread beat us to it
-    cache_populated_ = true;
+    cache_populated_     = true;
+    cache_populated_at_  = std::chrono::steady_clock::now();
 
     for (auto &[tname, bld] : builders) {
         if (!table_cache_.count(tname)) {
@@ -1288,6 +1302,10 @@ optional_ptr<DuckdSchemaEntry> DuckdCatalog::GetOrCreateSchema(
     auto entry   = make_uniq<DuckdSchemaEntry>(*this, info, url_, client_);
     auto *ptr    = entry.get();
     schema_cache_[schema_name] = std::move(entry);
+    if (!schema_cache_populated_) {
+        schema_cache_populated_    = true;
+        schema_cache_populated_at_ = std::chrono::steady_clock::now();
+    }
     return *ptr;
 }
 
@@ -1333,12 +1351,19 @@ optional_ptr<SchemaCatalogEntry> DuckdCatalog::LookupSchema(
 
     const auto &schema_name = schema_lookup.GetEntryName();
 
-    // Check cache first
+    // Check cache first — bypass if TTL has expired so that a schema deleted
+    // on the remote doesn't remain visible indefinitely.
     {
         std::lock_guard<std::mutex> lock(schema_mutex_);
         auto it = schema_cache_.find(schema_name);
         if (it != schema_cache_.end()) {
-            return *it->second;
+            bool ttl_ok = !schema_cache_populated_ ||
+                (std::chrono::steady_clock::now() - schema_cache_populated_at_
+                 < kSchemaCacheTTL);
+            if (ttl_ok) return *it->second;
+            // TTL expired: evict this entry and fall through to remote check.
+            schema_cache_.erase(it);
+            schema_cache_populated_ = false;
         }
     }
 
@@ -1387,6 +1412,14 @@ PhysicalOperator &DuckdCatalog::PlanInsert(ClientContext &ctx, PhysicalPlanGener
     if (!plan) {
         throw NotImplementedException(
             "duckd: INSERT without a child plan is not supported");
+    }
+
+    // RETURNING is not forwarded: the remote server executes the INSERT and
+    // returns only an affected-row count.  Raise early rather than silently
+    // returning wrong results to the user.
+    if (op.return_chunk) {
+        throw NotImplementedException(
+            "INSERT ... RETURNING is not supported for remote duckd tables");
     }
 
     // Apply default-value and column-ordering projection when columns are

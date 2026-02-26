@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
 
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -66,9 +67,10 @@ public:
     void        Checkpoint(ClientContext &context, bool force = false) override {}
 
 private:
-    std::shared_ptr<duckdb_client::DuckdFlightClient> client_;
-    std::mutex                                        mutex_;
-    std::vector<unique_ptr<DuckdTransaction>>         active_transactions_;
+    std::shared_ptr<duckdb_client::DuckdFlightClient>              client_;
+    std::mutex                                                     mutex_;
+    // Keyed by raw Transaction* for O(1) Commit/Rollback lookup.
+    std::unordered_map<Transaction *, unique_ptr<DuckdTransaction>> active_transactions_;
 };
 
 //===----------------------------------------------------------------------===//
@@ -159,6 +161,12 @@ private:
     optional_ptr<DuckdTableEntry> GetOrFetchTable(const string &table_name);
     void PopulateTableCache(); // fills table_cache_ from remote listing
     bool cache_populated_ = false;
+
+    // Table cache TTL: 60 s.  After expiry the next Scan/lookup triggers a
+    // fresh information_schema.columns query so remote schema changes become
+    // visible without requiring DETACH + ATTACH.
+    static constexpr std::chrono::seconds kTableCacheTTL{60};
+    std::chrono::steady_clock::time_point cache_populated_at_{};
 };
 
 //===----------------------------------------------------------------------===//
@@ -214,6 +222,11 @@ private:
 
     std::mutex                                                schema_mutex_;
     std::unordered_map<string, unique_ptr<DuckdSchemaEntry>>  schema_cache_;
+
+    // Schema cache TTL: 300 s.  Schemas change less often than tables.
+    static constexpr std::chrono::seconds kSchemaCacheTTL{300};
+    std::chrono::steady_clock::time_point schema_cache_populated_at_{};
+    bool schema_cache_populated_ = false;
 
     optional_ptr<DuckdSchemaEntry> GetOrCreateSchema(const string &schema_name);
 };
