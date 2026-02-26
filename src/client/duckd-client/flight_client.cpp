@@ -151,8 +151,10 @@ arrow::Result<int64_t> DuckdFlightClient::ExecuteUpdate(const std::string& sql) 
 arrow::Result<std::shared_ptr<arrow::Schema>> DuckdFlightClient::GetQuerySchema(
     const std::string& sql) {
 
-    // Execute with LIMIT 0 to get schema without fetching any rows
-    ARROW_ASSIGN_OR_RAISE(auto info, client_->Execute(call_options_, sql + " LIMIT 0"));
+    // Wrap in a subquery so that any trailing line comment in `sql` cannot
+    // accidentally consume the LIMIT 0 token (e.g. "SELECT ... -- comment").
+    ARROW_ASSIGN_OR_RAISE(auto info, client_->Execute(call_options_,
+        "SELECT * FROM (\n" + sql + "\n) AS _schema_probe LIMIT 0"));
     if (info->endpoints().empty()) {
         return arrow::Status::IOError("No endpoints returned for schema query: " + sql);
     }

@@ -94,55 +94,21 @@ static void DuckdExecFunction(DataChunk &args, ExpressionState & /*state*/,
 struct DuckdQueryTableBindData : public TableFunctionData {
     string url;
     string sql;
-    // Populated during bind
     vector<string>      column_names;
     vector<LogicalType> column_types;
     std::shared_ptr<duckdb_client::DuckdFlightClient> client;
 };
 
+// Streaming global state — mirrors DuckdScanGlobalState but without
+// projection/filter pushdown (duckd_query runs the SQL as-is on the server).
 struct DuckdQueryTableGlobalState : public GlobalTableFunctionState {
-    duckdb_client::DuckdQueryResult result;
-    idx_t                           batch_idx    = 0;
-    idx_t                           row_in_batch = 0;
-    bool                            finished     = false;
+    std::unique_ptr<duckdb_client::DuckdQueryStream> stream;
+    std::shared_ptr<arrow::RecordBatch>               current_batch;
+    idx_t                                             row_in_batch = 0;
+    bool                                              finished     = false;
 
     idx_t MaxThreads() const override { return 1; }
 };
-
-// Helper: convert Arrow schema to DuckDB types/names
-static void ExtractSchemaFromArrow(
-    const arrow::Schema &schema,
-    vector<string> &names,
-    vector<LogicalType> &types) {
-
-    for (int i = 0; i < schema.num_fields(); i++) {
-        auto &f = schema.field(i);
-        names.push_back(f->name());
-
-        // Basic Arrow → DuckDB type mapping
-        switch (f->type()->id()) {
-            case arrow::Type::BOOL:           types.push_back(LogicalType::BOOLEAN); break;
-            case arrow::Type::INT8:           types.push_back(LogicalType::TINYINT); break;
-            case arrow::Type::INT16:          types.push_back(LogicalType::SMALLINT); break;
-            case arrow::Type::INT32:          types.push_back(LogicalType::INTEGER); break;
-            case arrow::Type::INT64:          types.push_back(LogicalType::BIGINT); break;
-            case arrow::Type::UINT8:          types.push_back(LogicalType::UTINYINT); break;
-            case arrow::Type::UINT16:         types.push_back(LogicalType::USMALLINT); break;
-            case arrow::Type::UINT32:         types.push_back(LogicalType::UINTEGER); break;
-            case arrow::Type::UINT64:         types.push_back(LogicalType::UBIGINT); break;
-            case arrow::Type::FLOAT:          types.push_back(LogicalType::FLOAT); break;
-            case arrow::Type::DOUBLE:         types.push_back(LogicalType::DOUBLE); break;
-            case arrow::Type::DATE32:
-            case arrow::Type::DATE64:         types.push_back(LogicalType::DATE); break;
-            case arrow::Type::TIME32:
-            case arrow::Type::TIME64:         types.push_back(LogicalType::TIME); break;
-            case arrow::Type::TIMESTAMP:      types.push_back(LogicalType::TIMESTAMP); break;
-            case arrow::Type::BINARY:
-            case arrow::Type::LARGE_BINARY:   types.push_back(LogicalType::BLOB); break;
-            default:                          types.push_back(LogicalType::VARCHAR); break;
-        }
-    }
-}
 
 static unique_ptr<FunctionData> DuckdQueryTableBind(
     ClientContext &ctx, TableFunctionBindInput &input,
@@ -157,24 +123,33 @@ static unique_ptr<FunctionData> DuckdQueryTableBind(
     bind->sql    = input.inputs[1].GetValue<string>();
     bind->client = duckdb_client::DuckdClientRegistry::Instance().GetOrCreate(bind->url);
 
-    // Probe schema without fetching all data
+    // Probe schema via LIMIT 0 (no data transfer).
     auto schema_res = bind->client->GetQuerySchema(bind->sql);
     if (!schema_res.ok()) {
-        // GetQuerySchema appends LIMIT 0; try executing directly if it fails
-        // (some queries don't support LIMIT, e.g. CALL)
+        // GetQuerySchema wraps the query in LIMIT 0; fall back to a full
+        // execute for queries that don't support LIMIT (e.g. CALL).
         auto res = bind->client->ExecuteQuery(bind->sql);
         if (!res.ok()) {
             throw IOException("duckd_query: " + res.status().ToString());
         }
-        if (res.ValueUnsafe().schema) {
-            ExtractSchemaFromArrow(*res.ValueUnsafe().schema, names, return_types);
+        auto &r = res.ValueUnsafe();
+        if (r.schema) {
+            for (int i = 0; i < r.schema->num_fields(); i++) {
+                auto &f = r.schema->field(i);
+                names.push_back(f->name());
+                return_types.push_back(ArrowToDuckDBType(*f->type()));
+            }
         } else {
-            // Fallback: single INTEGER column for affected rows
             names.push_back("rows_affected");
             return_types.push_back(LogicalType::BIGINT);
         }
     } else {
-        ExtractSchemaFromArrow(*schema_res.ValueUnsafe(), names, return_types);
+        auto &arrow_schema = *schema_res.ValueUnsafe();
+        for (int i = 0; i < arrow_schema.num_fields(); i++) {
+            auto &f = arrow_schema.field(i);
+            names.push_back(f->name());
+            return_types.push_back(ArrowToDuckDBType(*f->type()));
+        }
     }
 
     bind->column_names = names;
@@ -188,38 +163,23 @@ static unique_ptr<GlobalTableFunctionState> DuckdQueryTableInitGlobal(
     auto &bd    = input.bind_data->Cast<DuckdQueryTableBindData>();
     auto  state = make_uniq<DuckdQueryTableGlobalState>();
 
-    auto result = bd.client->ExecuteQuery(bd.sql);
-    if (!result.ok()) {
-        throw IOException("duckd_query: " + result.status().ToString());
+    auto stream_res = bd.client->ExecuteQueryStream(bd.sql);
+    if (!stream_res.ok()) {
+        throw IOException("duckd_query: " + stream_res.status().ToString());
     }
-    state->result   = result.MoveValueUnsafe();
-    state->finished = state->result.batches.empty();
-    return std::move(state);
-}
+    state->stream = stream_res.MoveValueUnsafe();
 
-// Arrow scalar → DuckDB Value (duplicated from duckd_catalog.cpp for independence)
-static Value DuckdArrowToValue(const arrow::Array &arr, int64_t idx) {
-    if (arr.IsNull(idx)) return Value();
-    switch (arr.type_id()) {
-        case arrow::Type::BOOL:    return Value::BOOLEAN(static_cast<const arrow::BooleanArray&>(arr).Value(idx));
-        case arrow::Type::INT8:    return Value::TINYINT(static_cast<const arrow::Int8Array&>(arr).Value(idx));
-        case arrow::Type::INT16:   return Value::SMALLINT(static_cast<const arrow::Int16Array&>(arr).Value(idx));
-        case arrow::Type::INT32:   return Value::INTEGER(static_cast<const arrow::Int32Array&>(arr).Value(idx));
-        case arrow::Type::INT64:   return Value::BIGINT(static_cast<const arrow::Int64Array&>(arr).Value(idx));
-        case arrow::Type::UINT8:   return Value::UTINYINT(static_cast<const arrow::UInt8Array&>(arr).Value(idx));
-        case arrow::Type::UINT16:  return Value::USMALLINT(static_cast<const arrow::UInt16Array&>(arr).Value(idx));
-        case arrow::Type::UINT32:  return Value::UINTEGER(static_cast<const arrow::UInt32Array&>(arr).Value(idx));
-        case arrow::Type::UINT64:  return Value::UBIGINT(static_cast<const arrow::UInt64Array&>(arr).Value(idx));
-        case arrow::Type::FLOAT:   return Value::FLOAT(static_cast<const arrow::FloatArray&>(arr).Value(idx));
-        case arrow::Type::DOUBLE:  return Value::DOUBLE(static_cast<const arrow::DoubleArray&>(arr).Value(idx));
-        case arrow::Type::STRING:  return Value(static_cast<const arrow::StringArray&>(arr).GetString(idx));
-        case arrow::Type::LARGE_STRING: return Value(static_cast<const arrow::LargeStringArray&>(arr).GetString(idx));
-        default: {
-            auto sc = arr.GetScalar(idx);
-            if (sc.ok()) return Value(sc.ValueUnsafe()->ToString());
-            return Value();
-        }
+    // Pull the first batch eagerly so we detect an empty result immediately.
+    auto first = state->stream->Next();
+    if (!first.ok()) {
+        throw IOException("duckd_query: " + first.status().ToString());
     }
+    if (*first) {
+        state->current_batch = std::move(*first);
+    } else {
+        state->finished = true;
+    }
+    return std::move(state);
 }
 
 static void DuckdQueryTableFunction(ClientContext &ctx, TableFunctionInput &input,
@@ -231,39 +191,42 @@ static void DuckdQueryTableFunction(ClientContext &ctx, TableFunctionInput &inpu
         return;
     }
 
-    while (state.batch_idx < state.result.batches.size()) {
-        auto &batch = state.result.batches[state.batch_idx];
-        auto  avail = (idx_t)(batch->num_rows() - state.row_in_batch);
-
-        if (avail == 0) {
-            state.batch_idx++;
-            state.row_in_batch = 0;
-            continue;
+    // Advance to the next batch if the current one is exhausted.
+    while (state.current_batch &&
+           state.row_in_batch >= (idx_t)state.current_batch->num_rows()) {
+        auto next = state.stream->Next();
+        if (!next.ok()) {
+            throw IOException("duckd_query: " + next.status().ToString());
         }
-
-        idx_t to_fill = MinValue<idx_t>(avail, (idx_t)STANDARD_VECTOR_SIZE);
-
-        idx_t ncols = MinValue<idx_t>((idx_t)batch->num_columns(),
-                                       (idx_t)output.data.size());
-        for (idx_t col = 0; col < ncols; col++) {
-            auto &arrow_col = *batch->column((int)col);
-            for (idx_t row = 0; row < to_fill; row++) {
-                output.data[col].SetValue(
-                    row, DuckdArrowToValue(arrow_col, (int64_t)(state.row_in_batch + row)));
-            }
+        if (!*next) {
+            state.finished      = true;
+            state.current_batch = nullptr;
+            output.SetCardinality(0);
+            return;
         }
+        state.current_batch = std::move(*next);
+        state.row_in_batch  = 0;
+    }
 
-        output.SetCardinality(to_fill);
-        state.row_in_batch += to_fill;
-        if ((idx_t)batch->num_rows() <= state.row_in_batch) {
-            state.batch_idx++;
-            state.row_in_batch = 0;
-        }
+    if (!state.current_batch) {
+        state.finished = true;
+        output.SetCardinality(0);
         return;
     }
 
-    state.finished = true;
-    output.SetCardinality(0);
+    auto  &batch   = *state.current_batch;
+    idx_t  avail   = (idx_t)batch.num_rows() - state.row_in_batch;
+    idx_t  to_fill = MinValue<idx_t>(avail, (idx_t)STANDARD_VECTOR_SIZE);
+
+    // Zero-copy columnar fill — same path as the catalog scan.
+    idx_t ncols = MinValue<idx_t>((idx_t)batch.num_columns(), (idx_t)output.data.size());
+    for (idx_t col = 0; col < ncols; col++) {
+        FillColumnFromArrow(output.data[col], *batch.column((int)col),
+                            (int64_t)state.row_in_batch, to_fill);
+    }
+
+    output.SetCardinality(to_fill);
+    state.row_in_batch += to_fill;
 }
 
 //===----------------------------------------------------------------------===//

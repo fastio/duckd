@@ -10,6 +10,9 @@
 
 #include "flight_client.hpp"
 
+#include <arrow/api.h>
+#include <arrow/type.h>
+
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -214,5 +217,13 @@ private:
 
     optional_ptr<DuckdSchemaEntry> GetOrCreateSchema(const string &schema_name);
 };
+
+//===----------------------------------------------------------------------===//
+// Arrow ↔ DuckDB conversion utilities (shared with duckd_client_extension)
+//===----------------------------------------------------------------------===//
+
+LogicalType ArrowToDuckDBType(const arrow::DataType &type);
+void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
+                         int64_t src_offset, idx_t count);
 
 } // namespace duckdb

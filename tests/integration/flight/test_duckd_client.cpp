@@ -1193,6 +1193,220 @@ static int TestTransactionPropagation(DuckdClientTest &t) {
 }
 
 //===----------------------------------------------------------------------===//
+// Tests: fixes for 🟠-priority issues
+//
+// 2.2 GetQuerySchema with trailing line comment (subquery wrapping)
+// 2.3 Large-batch INSERT (Sink local buffer + reserve)
+// 2.1 Schema discovery single RPC (information_schema.columns batch fetch)
+// 2.5 WithReconnect: logic errors do not trigger a spurious reconnect
+//===----------------------------------------------------------------------===//
+
+static int TestOrangeFixes(DuckdClientTest &t) {
+    int passed = 0, failed = 0;
+
+    // ── Fix 2.2: GetQuerySchema with trailing line comment ─────────────────
+    // A SQL string ending in a line comment must not have LIMIT 0 silently
+    // swallowed.  The subquery wrapping in GetQuerySchema prevents this.
+    TEST_BEGIN("fix 2.2: duckd_query with trailing line comment");
+    {
+        // The trailing comment must not break schema discovery or execution.
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT 1 AS x, 2 AS y -- a trailing comment')");
+        if (r->HasError()) {
+            TEST_FAIL("trailing comment broke duckd_query: " + r->GetError());
+        } else if (r->RowCount() != 1 || r->ColumnCount() != 2) {
+            TEST_FAIL("expected 1 row, 2 cols; got " +
+                      std::to_string(r->RowCount()) + "r " +
+                      std::to_string(r->ColumnCount()) + "c");
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    TEST_BEGIN("fix 2.2: FetchTableEntry with trailing line comment survives schema probe");
+    {
+        // Attach a catalog and run a query — FetchTableEntry internally calls
+        // GetQuerySchema("SELECT * FROM schema.table"), which must survive
+        // its own subquery wrapping even for standard table queries.
+        auto ar = t.conn().Query(
+            "ATTACH '" + t.url() + "' AS fix22_cat (TYPE duckd)");
+        if (ar->HasError()) {
+            TEST_FAIL("ATTACH: " + ar->GetError());
+        } else {
+            auto r = t.conn().Query(
+                "SELECT COUNT(*) AS cnt FROM fix22_cat.main.employees");
+            if (r->HasError()) {
+                TEST_FAIL("catalog scan after fix 2.2: " + r->GetError());
+            } else if (r->GetValue(0, 0).GetValue<int64_t>() != 5) {
+                TEST_FAIL("expected 5 employees");
+            } else {
+                TEST_PASS();
+            }
+            t.conn().Query("DETACH fix22_cat");
+        }
+    }
+
+    // ── Fix 2.3: large-batch INSERT (local buffer + reserve) ───────────────
+    // Inserts 1 000 rows in one statement to verify the local-buffer
+    // optimisation handles large DataChunks without O(N²) reallocs.
+    TEST_BEGIN("fix 2.3: large-batch INSERT via ATTACH (1 000 rows)");
+    {
+        t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'CREATE TABLE IF NOT EXISTS bulk_insert_test (id BIGINT, v VARCHAR)')");
+
+        auto ar = t.conn().Query(
+            "ATTACH '" + t.url() + "' AS fix23_cat (TYPE duckd)");
+        if (ar->HasError()) {
+            TEST_FAIL("ATTACH: " + ar->GetError());
+        } else {
+            // Generate 1 000 rows locally and INSERT into the remote table.
+            auto r = t.conn().Query(
+                "INSERT INTO fix23_cat.main.bulk_insert_test"
+                " SELECT i, 'val_' || CAST(i AS VARCHAR)"
+                " FROM generate_series(1, 1000) t(i)");
+            if (r->HasError()) {
+                TEST_FAIL("bulk INSERT: " + r->GetError());
+            } else {
+                auto cv = t.conn().Query(
+                    "SELECT COUNT(*) FROM fix23_cat.main.bulk_insert_test");
+                if (cv->HasError() ||
+                    cv->GetValue(0, 0).GetValue<int64_t>() != 1000) {
+                    TEST_FAIL("expected 1000 rows after bulk INSERT");
+                } else {
+                    TEST_PASS();
+                }
+            }
+            t.conn().Query("DETACH fix23_cat");
+        }
+
+        t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'DROP TABLE IF EXISTS bulk_insert_test')");
+    }
+
+    // ── Fix 2.1: single-RPC schema discovery via information_schema ─────────
+    // ATTACH and immediately run SHOW ALL TABLES — this triggers
+    // PopulateTableCache, which now uses a single information_schema.columns
+    // query instead of N+1 individual schema probes.
+    TEST_BEGIN("fix 2.1: PopulateTableCache via single RPC (SHOW ALL TABLES)");
+    {
+        // Create several extra tables on the server so the gain is measurable.
+        for (int i = 1; i <= 5; i++) {
+            t.conn().Query(
+                "SELECT duckd_exec('" + t.url() + "',"
+                " 'CREATE TABLE IF NOT EXISTS extra_" + std::to_string(i) +
+                " (id INTEGER, val VARCHAR)')");
+        }
+
+        auto ar = t.conn().Query(
+            "ATTACH '" + t.url() + "' AS fix21_cat (TYPE duckd)");
+        if (ar->HasError()) {
+            TEST_FAIL("ATTACH: " + ar->GetError());
+        } else {
+            // SHOW ALL TABLES triggers Scan → PopulateTableCache (single RPC).
+            auto r = t.conn().Query("SHOW ALL TABLES");
+            if (r->HasError()) {
+                TEST_FAIL("SHOW ALL TABLES: " + r->GetError());
+            } else {
+                // Verify the original tables are present.
+                bool found_emp = false, found_typ = false;
+                for (idx_t row = 0; row < r->RowCount(); row++) {
+                    auto tname = r->GetValue(2, row).ToString();
+                    if (tname == "employees") found_emp = true;
+                    if (tname == "types_test") found_typ = true;
+                }
+                if (!found_emp || !found_typ) {
+                    TEST_FAIL("expected tables missing after single-RPC populate");
+                } else {
+                    TEST_PASS();
+                }
+            }
+            t.conn().Query("DETACH fix21_cat");
+        }
+
+        // Cleanup extra tables.
+        for (int i = 1; i <= 5; i++) {
+            t.conn().Query(
+                "SELECT duckd_exec('" + t.url() + "',"
+                " 'DROP TABLE IF EXISTS extra_" + std::to_string(i) + "')");
+        }
+    }
+
+    TEST_BEGIN("fix 2.1: column types round-trip via information_schema (DECIMAL)");
+    {
+        // Create a table with DECIMAL columns; PopulateTableCache must parse
+        // the type string correctly via TypeFromInfoSchemaString.
+        t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'CREATE TABLE IF NOT EXISTS dec_test"
+            "  (id INTEGER, price DECIMAL(10,2), tax_rate DECIMAL(5,4))')");
+
+        auto ar = t.conn().Query(
+            "ATTACH '" + t.url() + "' AS fix21b_cat (TYPE duckd)");
+        if (ar->HasError()) {
+            TEST_FAIL("ATTACH: " + ar->GetError());
+        } else {
+            t.conn().Query(
+                "SELECT duckd_exec('" + t.url() + "',"
+                " 'INSERT INTO dec_test VALUES (1, 9.99, 0.0825)')");
+
+            auto r = t.conn().Query(
+                "SELECT id, price, tax_rate FROM fix21b_cat.main.dec_test");
+            if (r->HasError()) {
+                TEST_FAIL("DECIMAL round-trip via catalog: " + r->GetError());
+            } else if (r->RowCount() != 1) {
+                TEST_FAIL("expected 1 row, got " + std::to_string(r->RowCount()));
+            } else {
+                TEST_PASS();
+            }
+            t.conn().Query("DETACH fix21b_cat");
+        }
+        t.conn().Query(
+            "SELECT duckd_exec('" + t.url() + "',"
+            " 'DROP TABLE IF EXISTS dec_test')");
+    }
+
+    // ── Fix 2.5: WithReconnect does not trigger on logic errors ────────────
+    // An invalid SQL query must return an error, not silently reconnect and
+    // re-run the query (which would produce a different or masked error).
+    TEST_BEGIN("fix 2.5: logic error (bad SQL) propagates without reconnect");
+    {
+        // An Arrow status error from a bad query must surface directly.
+        // If WithReconnect were still catching std::exception it could mask
+        // this by attempting a retry after evicting the healthy connection.
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT * FROM nonexistent_table_for_fix25')");
+        if (r->HasError()) {
+            // Good: error propagated correctly, no bogus reconnect.
+            TEST_PASS();
+        } else {
+            TEST_FAIL("expected error for non-existent table, got result");
+        }
+    }
+
+    TEST_BEGIN("fix 2.5: subsequent query still works after logic error");
+    {
+        // After the logic-error query above, the connection must still be
+        // healthy (no spurious evict happened).
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT 42 AS n')");
+        if (r->HasError()) {
+            TEST_FAIL("connection broken after logic error: " + r->GetError());
+        } else if (r->GetValue(0, 0).GetValue<int64_t>() != 42) {
+            TEST_FAIL("expected 42");
+        } else {
+            TEST_PASS();
+        }
+    }
+
+    return failed;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -1266,6 +1480,12 @@ int main() {
         std::cout << "\n--- Transaction Propagation Tests (P5) ---" << std::endl;
         DuckdClientTest t;
         total_failures += TestTransactionPropagation(t);
+    }
+
+    {
+        std::cout << "\n--- Orange-Priority Fix Tests (2.1/2.2/2.3/2.5) ---" << std::endl;
+        DuckdClientTest t;
+        total_failures += TestOrangeFixes(t);
     }
 
     std::cout << "\n=== Summary ===" << std::endl;

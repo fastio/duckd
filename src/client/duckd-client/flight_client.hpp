@@ -155,8 +155,10 @@ public:
         -> decltype(fn(std::declval<DuckdFlightClient &>())) {
         try {
             return fn(*GetOrCreate(url));
-        } catch (const std::exception &) {
-            // Evict the potentially broken connection and retry once.
+        } catch (const std::runtime_error &) {
+            // Only reconnect on connection-level errors thrown by Connect().
+            // Logic errors, Arrow status failures, and other exceptions must
+            // not silently trigger an evict+retry cycle.
             Evict(url);
             return fn(*GetOrCreate(url));
         }

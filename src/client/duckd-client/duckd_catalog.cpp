@@ -15,6 +15,7 @@
 #include "duckdb/common/enums/on_entry_not_found.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -54,7 +55,7 @@ namespace duckdb {
 // Utilities: Arrow → DuckDB type conversion
 //===----------------------------------------------------------------------===//
 
-static LogicalType ArrowToDuckDBType(const arrow::DataType &type) {
+LogicalType ArrowToDuckDBType(const arrow::DataType &type) {
     switch (type.id()) {
         case arrow::Type::BOOL:           return LogicalType::BOOLEAN;
         case arrow::Type::INT8:           return LogicalType::TINYINT;
@@ -160,6 +161,18 @@ static Value ArrowScalarToValue(const arrow::Array &arr, int64_t idx) {
         case arrow::Type::DATE32:
             return Value::DATE(date_t(
                 static_cast<const arrow::Date32Array &>(arr).Value(idx)));
+        case arrow::Type::DATE64: {
+            // Arrow DATE64 = milliseconds since epoch; DuckDB date_t = days
+            auto ms = static_cast<const arrow::Date64Array &>(arr).Value(idx);
+            return Value::DATE(date_t(static_cast<int32_t>(ms / 86400000LL)));
+        }
+        case arrow::Type::TIME32: {
+            // Arrow TIME32 unit is seconds or milliseconds; DuckDB dtime_t is µs
+            auto &typed  = static_cast<const arrow::Time32Array &>(arr);
+            auto  unit   = static_cast<const arrow::Time32Type &>(*arr.type()).unit();
+            int64_t factor = (unit == arrow::TimeUnit::SECOND) ? 1'000'000LL : 1'000LL;
+            return Value::TIME(dtime_t(static_cast<int64_t>(typed.Value(idx)) * factor));
+        }
         case arrow::Type::TIME64: {
             auto v = static_cast<const arrow::Time64Array &>(arr).Value(idx);
             return Value::TIME(dtime_t(v));
@@ -168,8 +181,23 @@ static Value ArrowScalarToValue(const arrow::Array &arr, int64_t idx) {
             auto v = static_cast<const arrow::TimestampArray &>(arr).Value(idx);
             return Value::TIMESTAMP(timestamp_t(v));
         }
+        case arrow::Type::DECIMAL128: {
+            // Extract 128-bit integer and preserve precision/scale from Arrow type.
+            // Decimal128Array::Value(i) returns const uint8_t* (16 raw bytes, little-endian).
+            auto &typed    = static_cast<const arrow::Decimal128Array &>(arr);
+            auto &dec_type = static_cast<const arrow::Decimal128Type &>(*arr.type());
+            const uint8_t *raw = typed.Value(idx);
+            uint64_t low_bits;
+            int64_t  high_bits;
+            std::memcpy(&low_bits,  raw,     8);
+            std::memcpy(&high_bits, raw + 8, 8);
+            hugeint_t hv;
+            hv.lower = low_bits;
+            hv.upper = high_bits;
+            return Value::DECIMAL(hv, dec_type.precision(), dec_type.scale());
+        }
         default: {
-            // Fallback: convert via Arrow scalar ToString
+            // Fallback: convert via Arrow scalar ToString (LIST, STRUCT, …)
             auto sc = arr.GetScalar(idx);
             if (sc.ok()) {
                 return Value(sc.ValueUnsafe()->ToString());
@@ -192,12 +220,14 @@ static Value ArrowScalarToValue(const arrow::Array &arr, int64_t idx) {
 // All other types fall back to the row-by-row ArrowScalarToValue path.
 //===----------------------------------------------------------------------===//
 
-static void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
-                                 int64_t src_offset, idx_t count) {
+void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
+                         int64_t src_offset, idx_t count) {
     auto &validity = FlatVector::Validity(dst);
 
-    // Mark null positions (validity mask starts all-valid on a fresh vector)
-    if (src.null_count() > 0) {
+    // Mark null positions (validity mask starts all-valid on a fresh vector).
+    // null_count() == -1 means "unknown" (common after slicing); treat as
+    // "may contain nulls" and always scan the bitmap in that case.
+    if (src.null_count() != 0) {
         for (idx_t i = 0; i < count; i++) {
             if (src.IsNull(src_offset + i)) {
                 validity.SetInvalid(i);
@@ -243,6 +273,32 @@ static void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
         const auto *sptr = src.data()->GetValues<int32_t>(1) + src_offset;
         auto       *dptr = FlatVector::GetData<date_t>(dst);
         std::memcpy(dptr, sptr, count * sizeof(int32_t));
+        break;
+    }
+
+    // DATE64: Arrow = int64 milliseconds since epoch; DuckDB date_t = int32 days
+    case arrow::Type::DATE64: {
+        auto &arr  = static_cast<const arrow::Date64Array &>(src);
+        auto *dptr = FlatVector::GetData<date_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                dptr[i] = date_t(static_cast<int32_t>(arr.Value(src_offset + i) / 86400000LL));
+            }
+        }
+        break;
+    }
+
+    // TIME32: Arrow stores seconds or milliseconds; DuckDB dtime_t is microseconds.
+    case arrow::Type::TIME32: {
+        auto &arr    = static_cast<const arrow::Time32Array &>(src);
+        auto  unit   = static_cast<const arrow::Time32Type &>(*src.type()).unit();
+        int64_t factor = (unit == arrow::TimeUnit::SECOND) ? 1'000'000LL : 1'000LL;
+        auto *dptr = FlatVector::GetData<dtime_t>(dst);
+        for (idx_t i = 0; i < count; i++) {
+            if (!src.IsNull(src_offset + i)) {
+                dptr[i] = dtime_t(static_cast<int64_t>(arr.Value(src_offset + i)) * factor);
+            }
+        }
         break;
     }
 
@@ -314,8 +370,63 @@ static void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
         break;
     }
 
+    // DECIMAL128: dispatch on DuckDB's physical storage type (determined by precision).
+    // Decimal128Array::Value(i) returns const uint8_t* (16 raw bytes, little-endian).
+    case arrow::Type::DECIMAL128: {
+        auto &typed = static_cast<const arrow::Decimal128Array &>(src);
+        switch (dst.GetType().InternalType()) {
+            case PhysicalType::INT16: {
+                auto *dptr = FlatVector::GetData<int16_t>(dst);
+                for (idx_t i = 0; i < count; i++) {
+                    if (!src.IsNull(src_offset + i)) {
+                        uint64_t low; std::memcpy(&low, typed.Value(src_offset + i), 8);
+                        dptr[i] = static_cast<int16_t>(low);
+                    }
+                }
+                break;
+            }
+            case PhysicalType::INT32: {
+                auto *dptr = FlatVector::GetData<int32_t>(dst);
+                for (idx_t i = 0; i < count; i++) {
+                    if (!src.IsNull(src_offset + i)) {
+                        uint64_t low; std::memcpy(&low, typed.Value(src_offset + i), 8);
+                        dptr[i] = static_cast<int32_t>(low);
+                    }
+                }
+                break;
+            }
+            case PhysicalType::INT64: {
+                auto *dptr = FlatVector::GetData<int64_t>(dst);
+                for (idx_t i = 0; i < count; i++) {
+                    if (!src.IsNull(src_offset + i)) {
+                        uint64_t low; std::memcpy(&low, typed.Value(src_offset + i), 8);
+                        dptr[i] = static_cast<int64_t>(low);
+                    }
+                }
+                break;
+            }
+            case PhysicalType::INT128: {
+                auto *dptr = FlatVector::GetData<hugeint_t>(dst);
+                for (idx_t i = 0; i < count; i++) {
+                    if (!src.IsNull(src_offset + i)) {
+                        const uint8_t *raw = typed.Value(src_offset + i);
+                        std::memcpy(&dptr[i].lower, raw,     8);
+                        std::memcpy(&dptr[i].upper, raw + 8, 8);
+                    }
+                }
+                break;
+            }
+            default:
+                for (idx_t i = 0; i < count; i++) {
+                    if (!src.IsNull(src_offset + i))
+                        dst.SetValue(i, ArrowScalarToValue(src, src_offset + i));
+                }
+        }
+        break;
+    }
+
     default: {
-        // Fallback: row-by-row scalar boxing (covers DECIMAL128, nested types, …)
+        // Fallback: row-by-row scalar boxing (covers nested LIST, STRUCT, …)
         for (idx_t i = 0; i < count; i++) {
             if (!src.IsNull(src_offset + i)) {
                 dst.SetValue(i, ArrowScalarToValue(src, src_offset + i));
@@ -325,6 +436,17 @@ static void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
     }
 
     } // switch
+}
+
+//===----------------------------------------------------------------------===//
+// Utilities: SQL identifier quoting
+//===----------------------------------------------------------------------===//
+
+// Wrap an identifier in double-quotes, doubling any embedded double-quotes.
+// This ensures reserved words, mixed-case names, and special characters are
+// handled correctly regardless of the remote server's identifier settings.
+static string QuoteIdentifier(const string &name) {
+    return "\"" + StringUtil::Replace(name, "\"", "\"\"") + "\"";
 }
 
 //===----------------------------------------------------------------------===//
@@ -404,7 +526,8 @@ static string FilterToSQL(const TableFilter &filter, const string &col_name) {
 struct DuckdInsertSinkState : public GlobalSinkState {
     string        sql_values;     // accumulated "(v1, v2), ..." text
     int64_t       affected_rows = 0;
-    std::mutex    mtx;
+    // No mutex needed: DuckDB does not parallelize this sink (no ParallelSink()
+    // override), so Sink() is called from a single thread at a time.
 };
 
 struct DuckdInsertSourceState : public GlobalSourceState {
@@ -432,7 +555,10 @@ public:
     // ── Sink interface ──────────────────────────────────────────────────────
 
     unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &) const override {
-        return make_uniq<DuckdInsertSinkState>();
+        auto state = make_uniq<DuckdInsertSinkState>();
+        // Pre-reserve 256 KB to avoid repeated realloc for typical batch sizes.
+        state->sql_values.reserve(256 * 1024);
+        return state;
     }
 
     SinkResultType Sink(ExecutionContext &ctx, DataChunk &chunk,
@@ -440,22 +566,33 @@ public:
         if (chunk.size() == 0) {
             return SinkResultType::NEED_MORE_INPUT;
         }
-        auto &gstate = input.global_state.Cast<DuckdInsertSinkState>();
-        std::lock_guard<std::mutex> lock(gstate.mtx);
 
+        // Build rows into a local buffer first to minimise the number of
+        // reallocs on the global string and avoid holding a lock while
+        // serialising values.  Average 64 bytes per row is a safe heuristic.
+        string local_rows;
+        local_rows.reserve(chunk.size() * 64);
+
+        const idx_t ncols = std::min<idx_t>(column_names_.size(), chunk.data.size());
         for (idx_t row = 0; row < chunk.size(); row++) {
-            if (!gstate.sql_values.empty()) {
-                gstate.sql_values += ", ";
+            if (!local_rows.empty()) {
+                local_rows += ", ";
             }
-            gstate.sql_values += "(";
-            for (idx_t col = 0; col < column_names_.size() && col < chunk.data.size(); col++) {
+            local_rows += "(";
+            for (idx_t col = 0; col < ncols; col++) {
                 if (col > 0) {
-                    gstate.sql_values += ", ";
+                    local_rows += ", ";
                 }
-                gstate.sql_values += ValueToSQLLiteral(chunk.data[col].GetValue(row));
+                local_rows += ValueToSQLLiteral(chunk.data[col].GetValue(row));
             }
-            gstate.sql_values += ")";
+            local_rows += ")";
         }
+
+        auto &gstate = input.global_state.Cast<DuckdInsertSinkState>();
+        if (!gstate.sql_values.empty()) {
+            gstate.sql_values += ", ";
+        }
+        gstate.sql_values += local_rows;
         return SinkResultType::NEED_MORE_INPUT;
     }
 
@@ -466,10 +603,11 @@ public:
             return SinkFinalizeType::READY; // nothing to insert
         }
 
-        string sql = "INSERT INTO " + schema_name_ + "." + table_name_ + " (";
+        string sql = "INSERT INTO " + QuoteIdentifier(schema_name_) +
+                     "." + QuoteIdentifier(table_name_) + " (";
         for (size_t i = 0; i < column_names_.size(); i++) {
             if (i > 0) sql += ", ";
-            sql += column_names_[i];
+            sql += QuoteIdentifier(column_names_[i]);
         }
         sql += ") VALUES " + gstate.sql_values;
 
@@ -622,13 +760,15 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
         if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
             output_to_arrow.push_back(-1); // synthetic rowid
         } else {
-            selected_cols.push_back(bd.column_names[col_id]);
+            selected_cols.push_back(QuoteIdentifier(bd.column_names[col_id]));
             output_to_arrow.push_back(arrow_col_idx++);
         }
     }
     state->output_to_arrow = std::move(output_to_arrow);
 
-    // Build WHERE clause from pushed-down filters
+    // Build WHERE clause from pushed-down filters.
+    // Column names are quoted before passing to FilterToSQL so the generated
+    // SQL handles reserved words and special characters correctly.
     vector<string> conditions;
     if (input.filters) {
         for (auto &[filter_idx, filter] : input.filters->filters) {
@@ -636,7 +776,8 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
                 auto col_id = input.column_ids[filter_idx];
                 if (col_id != COLUMN_IDENTIFIER_ROW_ID &&
                     col_id < (idx_t)bd.column_names.size()) {
-                    string cond = FilterToSQL(*filter, bd.column_names[col_id]);
+                    string cond = FilterToSQL(*filter,
+                                             QuoteIdentifier(bd.column_names[col_id]));
                     if (!cond.empty()) {
                         conditions.push_back(cond);
                     }
@@ -650,7 +791,8 @@ DuckdScanInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
                              ? "1"
                              : StringUtil::Join(selected_cols, ", ");
     string sql = "SELECT " + select_list +
-                 " FROM " + bd.schema_name + "." + bd.table_name;
+                 " FROM " + QuoteIdentifier(bd.schema_name) +
+                 "." + QuoteIdentifier(bd.table_name);
     if (!conditions.empty()) {
         sql += " WHERE " + StringUtil::Join(conditions, " AND ");
     }
@@ -836,7 +978,8 @@ static unique_ptr<DuckdTableEntry> FetchTableEntry(
     const std::shared_ptr<duckdb_client::DuckdFlightClient> &client) {
 
     // GetQuerySchema already appends " LIMIT 0" internally — do NOT add it here.
-    string sql       = "SELECT * FROM " + schema_name + "." + table_name;
+    string sql = "SELECT * FROM " + QuoteIdentifier(schema_name) +
+                 "." + QuoteIdentifier(table_name);
     auto schema_res  = client->GetQuerySchema(sql);
     if (!schema_res.ok()) {
         return nullptr;
@@ -875,37 +1018,112 @@ optional_ptr<DuckdTableEntry> DuckdSchemaEntry::GetOrFetchTable(
     return *ptr;
 }
 
+// Convert an information_schema.columns data_type string (plus numeric precision
+// and scale) into the corresponding DuckDB LogicalType.
+static LogicalType TypeFromInfoSchemaString(const string &data_type,
+                                             int numeric_precision,
+                                             int numeric_scale) {
+    // DECIMAL needs precision and scale, which come from separate columns.
+    if (data_type == "DECIMAL" || StringUtil::StartsWith(data_type, "DECIMAL(")) {
+        int prec = numeric_precision > 0 ? numeric_precision : 18;
+        int sc   = numeric_scale   >= 0  ? numeric_scale   : 3;
+        return LogicalType::DECIMAL(prec, sc);
+    }
+    // TIMESTAMP variants not distinguished by TransformStringToLogicalTypeId alone.
+    if (data_type == "TIMESTAMP WITH TIME ZONE") return LogicalType::TIMESTAMP_TZ;
+    if (data_type == "TIMESTAMP_S")  return LogicalType::TIMESTAMP_S;
+    if (data_type == "TIMESTAMP_MS") return LogicalType::TIMESTAMP_MS;
+    if (data_type == "TIMESTAMP_NS") return LogicalType::TIMESTAMP_NS;
+
+    // Standard simple types (INTEGER, BIGINT, VARCHAR, BOOLEAN, DATE, …)
+    auto type_id = TransformStringToLogicalTypeId(data_type);
+    if (type_id != LogicalTypeId::INVALID && type_id != LogicalTypeId::ANY) {
+        return LogicalType(type_id);
+    }
+    // Fallback: complex or unknown type (LIST, STRUCT, MAP, …) — surface as VARCHAR.
+    return LogicalType::VARCHAR;
+}
+
 void DuckdSchemaEntry::PopulateTableCache() {
-    // NOTE: entry_mutex_ is already held by the caller (Scan / GetOrFetchTable).
-    if (cache_populated_) {
+    // Fast-path check: if already populated bail without any RPC.
+    // This double-check is intentional — we must NOT hold entry_mutex_ during
+    // the network call below so we re-check under the lock at the end.
+    {
+        std::lock_guard<std::mutex> lk(entry_mutex_);
+        if (cache_populated_) return;
+    }
+
+    // --- RPC phase: performed OUTSIDE any lock ----------------------------
+    // Single query to information_schema.columns fetches every column for
+    // every table in this schema at once, reducing N+1 RPCs to exactly 1.
+    string escaped = StringUtil::Replace(name, "'", "''");
+    string sql =
+        "SELECT table_name, column_name, data_type, "
+        "       COALESCE(numeric_precision, 0), COALESCE(numeric_scale, 0) "
+        "FROM information_schema.columns "
+        "WHERE table_schema = '" + escaped + "' "
+        "ORDER BY table_name, ordinal_position";
+
+    auto res = client_->ExecuteQuery(sql);
+    if (!res.ok()) {
+        // Network error — leave cache empty; the next Scan/lookup will retry.
         return;
     }
+
+    // Build a CreateTableInfo per table from the columnar result.
+    struct Builder { CreateTableInfo info; };
+    std::unordered_map<string, Builder> builders;
+
+    for (auto &batch : res.ValueUnsafe().batches) {
+        if (batch->num_columns() < 5) continue;
+        auto &t_col  = static_cast<const arrow::StringArray &>(*batch->column(0));
+        auto &c_col  = static_cast<const arrow::StringArray &>(*batch->column(1));
+        auto &ty_col = static_cast<const arrow::StringArray &>(*batch->column(2));
+
+        // numeric_precision / numeric_scale are INTEGER in DuckDB's
+        // information_schema, but guard against other numeric types.
+        auto extract_int = [&](int col_idx, int64_t row) -> int {
+            auto &arr = *batch->column(col_idx);
+            if (arr.IsNull(row)) return 0;
+            switch (arr.type_id()) {
+                case arrow::Type::INT32:
+                    return static_cast<const arrow::Int32Array &>(arr).Value(row);
+                case arrow::Type::INT64:
+                    return static_cast<int>(
+                        static_cast<const arrow::Int64Array &>(arr).Value(row));
+                default: return 0;
+            }
+        };
+
+        for (int64_t row = 0; row < batch->num_rows(); row++) {
+            if (t_col.IsNull(row) || c_col.IsNull(row) || ty_col.IsNull(row)) continue;
+            string tname   = t_col.GetString(row);
+            string colname = c_col.GetString(row);
+            string typestr = ty_col.GetString(row);
+            int    prec    = extract_int(3, row);
+            int    scale   = extract_int(4, row);
+
+            auto &bld = builders[tname];
+            if (bld.info.catalog.empty()) {
+                bld.info.catalog = catalog.GetName();
+                bld.info.schema  = name;
+                bld.info.table   = tname;
+            }
+            bld.info.columns.AddColumn(
+                ColumnDefinition(colname,
+                    TypeFromInfoSchemaString(typestr, prec, scale)));
+        }
+    }
+
+    // --- Write phase: acquire lock, double-check, populate ----------------
+    std::lock_guard<std::mutex> lk(entry_mutex_);
+    if (cache_populated_) return; // another thread beat us to it
     cache_populated_ = true;
 
-    // Query the remote's information_schema for tables in this schema
-    string sql = "SELECT table_name FROM information_schema.tables "
-                 "WHERE table_schema = '" +
-                 StringUtil::Replace(name, "'", "''") + "' ORDER BY table_name";
-
-    auto result = client_->ExecuteQuery(sql);
-    if (!result.ok()) {
-        return;
-    }
-
-    for (auto &batch : result.ValueUnsafe().batches) {
-        if (batch->num_columns() < 1) continue;
-        auto &col = *batch->column(0);
-        for (int64_t row = 0; row < batch->num_rows(); row++) {
-            if (!col.IsNull(row)) {
-                string tname = static_cast<const arrow::StringArray &>(col).GetString(row);
-                if (table_cache_.find(tname) == table_cache_.end()) {
-                    // Fetch directly without re-acquiring the lock
-                    auto entry = FetchTableEntry(catalog, *this, name, tname, url_, client_);
-                    if (entry) {
-                        table_cache_[tname] = std::move(entry);
-                    }
-                }
-            }
+    for (auto &[tname, bld] : builders) {
+        if (!table_cache_.count(tname)) {
+            table_cache_[tname] = make_uniq<DuckdTableEntry>(
+                catalog, *this, bld.info, url_, name, client_);
         }
     }
 }
@@ -931,9 +1149,11 @@ void DuckdSchemaEntry::Scan(ClientContext &context, CatalogType type,
     if (type != CatalogType::TABLE_ENTRY && type != CatalogType::VIEW_ENTRY) {
         return;
     }
-    std::lock_guard<std::mutex> lock(entry_mutex_);
+    // PopulateTableCache() manages its own locking and performs the RPC
+    // outside the lock to avoid blocking other schema accessors.
     PopulateTableCache();
-    for (auto &[name, entry] : table_cache_) {
+    std::lock_guard<std::mutex> lock(entry_mutex_);
+    for (auto &[n, entry] : table_cache_) {
         callback(*entry);
     }
 }
@@ -985,7 +1205,7 @@ void DuckdSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
     if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
         sql += " IF EXISTS";
     }
-    sql += " " + name + "." + info.name;
+    sql += " " + QuoteIdentifier(name) + "." + QuoteIdentifier(info.name);
 
     auto result = client_->ExecuteUpdate(sql);
     if (!result.ok()) {
@@ -1074,7 +1294,7 @@ optional_ptr<DuckdSchemaEntry> DuckdCatalog::GetOrCreateSchema(
 optional_ptr<CatalogEntry> DuckdCatalog::CreateSchema(
     CatalogTransaction transaction, CreateSchemaInfo &info) {
 
-    string sql    = "CREATE SCHEMA " + info.schema;
+    string sql    = "CREATE SCHEMA " + QuoteIdentifier(info.schema);
     auto   result = client_->ExecuteUpdate(sql);
     if (!result.ok()) {
         throw IOException("duckd: CREATE SCHEMA failed: " + result.status().ToString());

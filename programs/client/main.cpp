@@ -157,9 +157,8 @@ int main(int argc, char *argv[]) {
             }
             if (trimlow == ".tables") {
                 auto r = conn.Query(
-                    "SELECT table_name FROM duckd_query('" + url + "',"
-                    " 'SELECT table_name FROM information_schema.tables"
-                    "  WHERE table_schema = ''main'' ORDER BY table_name')");
+                    "SELECT table_name FROM " + alias + ".information_schema.tables"
+                    " WHERE table_schema = 'main' ORDER BY table_name");
                 if (!r->HasError()) PrintResult(*r);
                 else std::cerr << "Error: " << r->GetError() << "\n";
                 continue;
@@ -171,11 +170,9 @@ int main(int argc, char *argv[]) {
                 } else {
                     auto r = conn.Query(
                         "SELECT column_name, data_type, is_nullable"
-                        " FROM duckd_query('" + url + "',"
-                        " 'SELECT column_name, data_type, is_nullable"
-                        "  FROM information_schema.columns"
-                        "  WHERE table_name = ''" + tbl + "''"
-                        "  ORDER BY ordinal_position')");
+                        " FROM " + alias + ".information_schema.columns"
+                        " WHERE table_name = '" + tbl + "'"
+                        " ORDER BY ordinal_position");
                     if (!r->HasError()) PrintResult(*r);
                     else std::cerr << "Error: " << r->GetError() << "\n";
                 }
