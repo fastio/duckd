@@ -221,6 +221,40 @@ public:
     }
 
     //===------------------------------------------------------------------===//
+    // COPY Protocol Messages
+    //===------------------------------------------------------------------===//
+    void WriteCopyOutResponse(int16_t num_columns, int8_t overall_format = 0) {
+        StartMessage(BackendMessage::CopyOutResponse);
+        WriteByte(static_cast<uint8_t>(overall_format));  // 0=text, 1=binary
+        WriteInt16(num_columns);
+        for (int16_t i = 0; i < num_columns; i++) {
+            WriteInt16(static_cast<int16_t>(overall_format));  // per-column format
+        }
+        EndMessage();
+    }
+
+    void WriteCopyInResponse(int16_t num_columns, int8_t overall_format = 0) {
+        StartMessage(BackendMessage::CopyInResponse);
+        WriteByte(static_cast<uint8_t>(overall_format));
+        WriteInt16(num_columns);
+        for (int16_t i = 0; i < num_columns; i++) {
+            WriteInt16(static_cast<int16_t>(overall_format));
+        }
+        EndMessage();
+    }
+
+    void WriteCopyData(const char* data, size_t len) {
+        StartMessage(BackendMessage::CopyData);
+        buffer.insert(buffer.end(), data, data + len);
+        EndMessage();
+    }
+
+    void WriteCopyDone() {
+        StartMessage(BackendMessage::CopyDone);
+        EndMessage();
+    }
+
+    //===------------------------------------------------------------------===//
     // Error/Notice Messages
     //===------------------------------------------------------------------===//
     void WriteErrorResponse(const std::string& severity,

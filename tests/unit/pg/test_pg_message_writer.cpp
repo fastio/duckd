@@ -746,6 +746,103 @@ void TestWriteDataRowDirectBinary() {
 }
 
 //===----------------------------------------------------------------------===//
+// COPY Protocol Message Tests
+//===----------------------------------------------------------------------===//
+
+void TestWriteCopyOutResponse() {
+    std::cout << "  Testing WriteCopyOutResponse..." << std::endl;
+
+    PgMessageWriter writer;
+    writer.WriteCopyOutResponse(3, 0);
+
+    const auto& buf = writer.GetBuffer();
+
+    assert(buf[0] == 'H');  // CopyOutResponse type
+
+    int32_t length = ExtractInt32(buf, 1);
+    // length = 4 + 1(format) + 2(num_cols) + 3*2(per-col formats) = 13
+    assert(length == 13);
+
+    // Overall format: text (0)
+    assert(buf[5] == 0);
+
+    // Number of columns
+    int16_t num_cols = ExtractInt16(buf, 6);
+    assert(num_cols == 3);
+
+    // Per-column format codes (all 0 for text)
+    for (int i = 0; i < 3; i++) {
+        int16_t fmt = ExtractInt16(buf, 8 + i * 2);
+        assert(fmt == 0);
+    }
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestWriteCopyInResponse() {
+    std::cout << "  Testing WriteCopyInResponse..." << std::endl;
+
+    PgMessageWriter writer;
+    writer.WriteCopyInResponse(2, 0);
+
+    const auto& buf = writer.GetBuffer();
+
+    assert(buf[0] == 'G');  // CopyInResponse type
+
+    int32_t length = ExtractInt32(buf, 1);
+    // length = 4 + 1(format) + 2(num_cols) + 2*2(per-col formats) = 11
+    assert(length == 11);
+
+    // Overall format: text (0)
+    assert(buf[5] == 0);
+
+    // Number of columns
+    int16_t num_cols = ExtractInt16(buf, 6);
+    assert(num_cols == 2);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestWriteCopyData() {
+    std::cout << "  Testing WriteCopyData..." << std::endl;
+
+    PgMessageWriter writer;
+    std::string row = "1\tAlice\t30\n";
+    writer.WriteCopyData(row.data(), row.size());
+
+    const auto& buf = writer.GetBuffer();
+
+    assert(buf[0] == 'd');  // CopyData type
+
+    int32_t length = ExtractInt32(buf, 1);
+    assert(length == static_cast<int32_t>(4 + row.size()));
+
+    // Verify payload
+    std::string payload(reinterpret_cast<const char*>(buf.data() + 5), row.size());
+    assert(payload == row);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestWriteCopyDone() {
+    std::cout << "  Testing WriteCopyDone..." << std::endl;
+
+    PgMessageWriter writer;
+    writer.WriteCopyDone();
+
+    const auto& buf = writer.GetBuffer();
+
+    // Message: type(1) + length(4) = 5 bytes
+    assert(buf.size() == 5);
+    assert(buf[0] == 'c');  // CopyDone type
+
+    int32_t length = ExtractInt32(buf, 1);
+    assert(length == 4);  // Just the length field
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -784,7 +881,13 @@ int main() {
     TestClearBuffer();
     TestMultipleMessages();
 
-    std::cout << "\n7. Binary Format:" << std::endl;
+    std::cout << "\n7. COPY Protocol Messages:" << std::endl;
+    TestWriteCopyOutResponse();
+    TestWriteCopyInResponse();
+    TestWriteCopyData();
+    TestWriteCopyDone();
+
+    std::cout << "\n8. Binary Format:" << std::endl;
     TestFormatCellBinaryBool();
     TestFormatCellBinaryInt();
     TestFormatCellBinaryFloat();

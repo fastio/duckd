@@ -63,6 +63,7 @@ enum class PgConnectionState {
     READY,          // Ready for queries
     IN_QUERY,       // Processing simple query
     IN_EXTENDED,    // Processing extended query protocol
+    IN_COPY_IN,     // COPY FROM STDIN: waiting for CopyData/CopyDone/CopyFail
     FAILED,         // Connection failed
     CLOSED          // Connection closed
 };
@@ -115,6 +116,13 @@ private:
     void HandleFlush(const uint8_t* data, size_t len);
     void HandleTerminate(const uint8_t* data, size_t len);
 
+    // COPY protocol handlers
+    void HandleCopyToStdout(const std::string& sql);
+    void HandleCopyFromStdin(const std::string& sql);
+    void HandleCopyData(const uint8_t* data, size_t len);
+    void HandleCopyDone(const uint8_t* data, size_t len);
+    void HandleCopyFail(const uint8_t* data, size_t len);
+
     // Query execution helpers (used in async lambdas with local writer)
     static void WriteQueryResult(PgMessageWriter& writer, duckdb::QueryResult& result,
                                  const std::string& command, const std::string& sql,
@@ -154,6 +162,10 @@ private:
     // Using phmap::flat_hash_map for better performance than std::unordered_map
     phmap::flat_hash_map<std::string, PreparedStatementInfo> prepared_statements;
     phmap::flat_hash_map<std::string, PortalInfo> portals;
+
+    // COPY FROM STDIN state
+    std::string copy_from_sql;           // Original SQL to rewrite for DuckDB
+    std::vector<uint8_t> copy_buffer_;   // Accumulated CopyData bytes
 
     // Buffer for incomplete messages
     std::vector<uint8_t> buffer;

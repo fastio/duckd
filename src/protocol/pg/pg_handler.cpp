@@ -12,8 +12,10 @@
 #include "logging/logger.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <random>
+#include <unistd.h>
 
 namespace duckdb_server {
 namespace pg {
@@ -149,6 +151,30 @@ static bool SqlContainsCI(const char* sql, size_t len, size_t start, const char*
     return false;
 }
 
+// Find case-insensitive position of keyword. Returns npos if not found.
+static size_t SqlFindCI(const char* sql, size_t len, const char* keyword) {
+    size_t klen = strlen(keyword);
+    if (klen == 0 || len < klen) return std::string::npos;
+    for (size_t i = 0; i + klen <= len; i++) {
+        if (strncasecmp(sql + i, keyword, klen) == 0) return i;
+    }
+    return std::string::npos;
+}
+
+// Escape a text field for PG COPY text format.
+// Backslash-escapes: \ → \\, tab → \t, newline → \n, carriage return → \r
+static void AppendCopyTextField(std::string& out, const std::string& field) {
+    for (char c : field) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '\t': out += "\\t"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            default:   out += c; break;
+        }
+    }
+}
+
 bool PgHandler::HandleStartup(const uint8_t* data, size_t len) {
     PgMessageReader reader(data, len);
     StartupMessage msg;
@@ -261,6 +287,15 @@ bool PgHandler::HandleMessage(char type, const uint8_t* data, size_t len) {
         case FrontendMessage::Flush:
             HandleFlush(data, len);
             break;
+        case FrontendMessage::CopyData:
+            HandleCopyData(data, len);
+            break;
+        case FrontendMessage::CopyDone:
+            HandleCopyDone(data, len);
+            break;
+        case FrontendMessage::CopyFail:
+            HandleCopyFail(data, len);
+            break;
         case FrontendMessage::Terminate:
             HandleTerminate(data, len);
             return false;
@@ -292,6 +327,21 @@ void PgHandler::HandleQuery(const uint8_t* data, size_t len) {
         writer.WriteReadyForQuery(GetTransactionStatus());
         send_callback(writer.TakeBuffer());
         return;
+    }
+
+    // Check for COPY protocol commands
+    if (SqlStartsWithCI(sql.data(), sql.size(), "COPY")) {
+        size_t to_stdout_pos = SqlFindCI(sql.data(), sql.size(), "TO STDOUT");
+        size_t from_stdin_pos = SqlFindCI(sql.data(), sql.size(), "FROM STDIN");
+
+        if (to_stdout_pos != std::string::npos) {
+            HandleCopyToStdout(sql);
+            return;
+        } else if (from_stdin_pos != std::string::npos) {
+            HandleCopyFromStdin(sql);
+            return;
+        }
+        // Fall through: regular COPY (to file) handled by DuckDB normally
     }
 
     // Dispatch to executor pool
@@ -735,6 +785,309 @@ void PgHandler::HandleFlush(const uint8_t* data, size_t len) {
     (void)data;
     (void)len;
     // Flush is a no-op for us since we send immediately
+}
+
+//===----------------------------------------------------------------------===//
+// COPY Protocol Implementation
+//===----------------------------------------------------------------------===//
+
+// Parse the source expression from COPY ... TO STDOUT.
+// Supports: COPY table_name TO STDOUT ...
+//           COPY (subquery) TO STDOUT ...
+// Returns the SELECT equivalent to execute.
+static std::string ExtractCopyToSelect(const std::string& sql) {
+    // Skip leading whitespace and "COPY"
+    size_t pos = 0;
+    while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) pos++;
+    pos += 4; // skip "COPY"
+    while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) pos++;
+
+    if (pos < sql.size() && sql[pos] == '(') {
+        // COPY (subquery) TO STDOUT — extract the subquery
+        int depth = 0;
+        size_t start = pos + 1;
+        for (size_t i = pos; i < sql.size(); i++) {
+            if (sql[i] == '(') depth++;
+            else if (sql[i] == ')') {
+                depth--;
+                if (depth == 0) {
+                    return sql.substr(start, i - start);
+                }
+            }
+        }
+        // Unbalanced parens — return as-is and let DuckDB error
+        return sql.substr(start);
+    }
+
+    // COPY table_name [(col_list)] TO STDOUT
+    // Extract table name (possibly schema.table)
+    size_t name_start = pos;
+    // Find TO keyword
+    size_t to_pos = SqlFindCI(sql.data(), sql.size(), " TO ");
+    if (to_pos == std::string::npos) {
+        return "SELECT * FROM " + sql.substr(name_start);
+    }
+
+    std::string source = sql.substr(name_start, to_pos - name_start);
+    // Trim trailing whitespace
+    while (!source.empty() && std::isspace(static_cast<unsigned char>(source.back()))) {
+        source.pop_back();
+    }
+
+    // Check if there's a column list: "table_name (col1, col2)"
+    size_t paren_pos = source.find('(');
+    if (paren_pos != std::string::npos) {
+        std::string table = source.substr(0, paren_pos);
+        while (!table.empty() && std::isspace(static_cast<unsigned char>(table.back()))) {
+            table.pop_back();
+        }
+        // Extract column list
+        size_t end_paren = source.find(')', paren_pos);
+        if (end_paren != std::string::npos) {
+            std::string cols = source.substr(paren_pos + 1, end_paren - paren_pos - 1);
+            return "SELECT " + cols + " FROM " + table;
+        }
+    }
+
+    return "SELECT * FROM " + source;
+}
+
+void PgHandler::HandleCopyToStdout(const std::string& sql) {
+    LOG_DEBUG("pg", "COPY TO STDOUT: " + sql);
+
+    std::string select_sql = ExtractCopyToSelect(sql);
+
+    // Dispatch to executor pool
+    async_pending = true;
+    auto sess = session;
+    auto send_cb = send_callback;
+    auto resume_cb = resume_callback;
+
+    executor_pool->Submit([this, select_sql = std::move(select_sql), sess, send_cb, resume_cb]() {
+        PgMessageWriter writer;
+        bool has_error = false;
+        uint64_t row_count = 0;
+        sess->MarkQueryStart();
+
+        try {
+            auto result = sess->GetConnection().Query(select_sql);
+
+            if (result->HasError()) {
+                writer.WriteErrorResponse("ERROR", "42000", result->GetError());
+                has_error = true;
+            } else {
+                idx_t col_count = result->ColumnCount();
+
+                // Send CopyOutResponse (text format, col_count columns)
+                writer.WriteCopyOutResponse(static_cast<int16_t>(col_count), 0);
+                send_cb(writer.TakeBuffer());
+
+                // Stream rows as CopyData messages (PG COPY text format: tab-separated)
+                std::string line;
+                while (true) {
+                    auto chunk = result->Fetch();
+                    if (!chunk || chunk->size() == 0) break;
+
+                    for (idx_t row = 0; row < chunk->size(); row++) {
+                        line.clear();
+                        for (idx_t col = 0; col < col_count; col++) {
+                            if (col > 0) line += '\t';
+                            auto val = chunk->GetValue(col, row);
+                            if (val.IsNull()) {
+                                line += "\\N";
+                            } else {
+                                std::string text = val.ToString();
+                                AppendCopyTextField(line, text);
+                            }
+                        }
+                        line += '\n';
+                        writer.WriteCopyData(line.data(), line.size());
+                        row_count++;
+                    }
+                    // Flush per chunk
+                    send_cb(writer.TakeBuffer());
+                }
+
+                // Send CopyDone + CommandComplete
+                writer.WriteCopyDone();
+                writer.WriteCommandComplete("COPY " + std::to_string(row_count));
+            }
+        } catch (const std::exception& e) {
+            writer.WriteErrorResponse("ERROR", "XX000", e.what());
+            has_error = true;
+        }
+
+        auto response_buf = writer.TakeBuffer();
+        sess->MarkQueryEnd();
+
+        resume_cb([this, has_error, buf = std::move(response_buf), send_cb]() mutable {
+            if (has_error && in_transaction) {
+                transaction_failed = true;
+            }
+
+            this->writer.Clear();
+            this->writer.WriteReadyForQuery(GetTransactionStatus());
+            const auto& rfq = this->writer.GetBuffer();
+            buf.insert(buf.end(), rfq.begin(), rfq.end());
+
+            send_cb(std::move(buf));
+        });
+    });
+}
+
+void PgHandler::HandleCopyFromStdin(const std::string& sql) {
+    LOG_DEBUG("pg", "COPY FROM STDIN: " + sql);
+
+    // Store the original SQL for later use when CopyDone arrives.
+    // We'll rewrite FROM STDIN to FROM '/tmp/...' at that point.
+    copy_from_sql = sql;
+    copy_buffer_.clear();
+
+    // Determine number of columns from the SQL.
+    // We send column count = 0 since PG docs say the column count in CopyInResponse
+    // is the number of columns, but clients don't strictly depend on it for text mode.
+    // Parse column list if present, otherwise default to 0 (clients handle it).
+    // Actually, we need to figure out column count. Let's just use 0 — the text format
+    // with overall_format=0 is the standard approach.
+    writer.Clear();
+    writer.WriteCopyInResponse(0, 0);
+    send_callback(writer.TakeBuffer());
+
+    // Switch to IN_COPY_IN state — the message loop will route CopyData/CopyDone/CopyFail to us
+    state = PgConnectionState::IN_COPY_IN;
+}
+
+void PgHandler::HandleCopyData(const uint8_t* data, size_t len) {
+    if (state != PgConnectionState::IN_COPY_IN) {
+        SendError("ERROR", "08P01", "CopyData received outside COPY mode");
+        SendReadyForQuery();
+        return;
+    }
+
+    // Append raw data to copy buffer
+    copy_buffer_.insert(copy_buffer_.end(), data, data + len);
+}
+
+void PgHandler::HandleCopyDone(const uint8_t* data, size_t len) {
+    (void)data;
+    (void)len;
+
+    if (state != PgConnectionState::IN_COPY_IN) {
+        SendError("ERROR", "08P01", "CopyDone received outside COPY mode");
+        SendReadyForQuery();
+        return;
+    }
+
+    state = PgConnectionState::READY;
+
+    // Write copy buffer to a temp file, then execute COPY FROM that file
+    async_pending = true;
+    auto sess = session;
+    auto send_cb = send_callback;
+    auto resume_cb = resume_callback;
+    auto copy_sql = std::move(copy_from_sql);
+    auto copy_data = std::move(copy_buffer_);
+
+    executor_pool->Submit([this, copy_sql = std::move(copy_sql),
+                           copy_data = std::move(copy_data), sess, send_cb, resume_cb]() {
+        PgMessageWriter writer;
+        bool has_error = false;
+        sess->MarkQueryStart();
+
+        // Create temp file
+        char tmppath[] = "/tmp/duckd_copy_XXXXXX";
+        int fd = mkstemp(tmppath);
+        if (fd < 0) {
+            writer.WriteErrorResponse("ERROR", "XX000", "Failed to create temp file for COPY");
+            has_error = true;
+        } else {
+            // Write data
+            if (!copy_data.empty()) {
+                ssize_t written = write(fd, copy_data.data(), copy_data.size());
+                (void)written;
+            }
+            close(fd);
+
+            // Rewrite SQL: replace FROM STDIN with FROM 'tmppath'
+            std::string rewritten = copy_sql;
+            size_t stdin_pos = SqlFindCI(rewritten.data(), rewritten.size(), "FROM STDIN");
+            if (stdin_pos != std::string::npos) {
+                // Replace "FROM STDIN" with "FROM '/tmp/duckd_copy_XXXXXX'"
+                std::string replacement = "FROM '" + std::string(tmppath) + "'";
+                rewritten.replace(stdin_pos, 10, replacement); // "FROM STDIN" is 10 chars
+            }
+
+            try {
+                auto result = sess->GetConnection().Query(rewritten);
+
+                if (result->HasError()) {
+                    writer.WriteErrorResponse("ERROR", "42000", result->GetError());
+                    has_error = true;
+                } else {
+                    // Get row count from result
+                    uint64_t row_count = 0;
+                    auto chunk = result->Fetch();
+                    if (chunk && chunk->size() > 0) {
+                        // DuckDB COPY returns a result with the count
+                        auto val = chunk->GetValue(0, 0);
+                        if (!val.IsNull()) {
+                            try {
+                                row_count = val.GetValue<uint64_t>();
+                            } catch (...) {
+                                row_count = 0;
+                            }
+                        }
+                    }
+                    writer.WriteCommandComplete("COPY " + std::to_string(row_count));
+                }
+            } catch (const std::exception& e) {
+                writer.WriteErrorResponse("ERROR", "XX000", e.what());
+                has_error = true;
+            }
+
+            // Clean up temp file
+            unlink(tmppath);
+        }
+
+        auto response_buf = writer.TakeBuffer();
+        sess->MarkQueryEnd();
+
+        resume_cb([this, has_error, buf = std::move(response_buf), send_cb]() mutable {
+            if (has_error && in_transaction) {
+                transaction_failed = true;
+            }
+
+            this->writer.Clear();
+            this->writer.WriteReadyForQuery(GetTransactionStatus());
+            const auto& rfq = this->writer.GetBuffer();
+            buf.insert(buf.end(), rfq.begin(), rfq.end());
+
+            send_cb(std::move(buf));
+        });
+    });
+}
+
+void PgHandler::HandleCopyFail(const uint8_t* data, size_t len) {
+    if (state != PgConnectionState::IN_COPY_IN) {
+        SendError("ERROR", "08P01", "CopyFail received outside COPY mode");
+        SendReadyForQuery();
+        return;
+    }
+
+    // Extract error message from CopyFail
+    std::string error_msg;
+    if (len > 0) {
+        error_msg = std::string(reinterpret_cast<const char*>(data), strnlen(reinterpret_cast<const char*>(data), len));
+    } else {
+        error_msg = "COPY FROM STDIN failed";
+    }
+
+    state = PgConnectionState::READY;
+    copy_from_sql.clear();
+    copy_buffer_.clear();
+
+    SendError("ERROR", "57014", error_msg);
+    SendReadyForQuery();
 }
 
 void PgHandler::HandleTerminate(const uint8_t* data, size_t len) {

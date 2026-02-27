@@ -250,6 +250,32 @@ public:
         return ProcessAndWait(buf);
     }
 
+    // Send CopyData message ('d')
+    bool SendCopyData(const std::string& data) {
+        std::vector<uint8_t> buf;
+        buf.push_back('d');
+        int32_t length = static_cast<int32_t>(4 + data.size());
+        WriteInt32(buf, length);
+        buf.insert(buf.end(), data.begin(), data.end());
+        return ProcessAndWait(buf);
+    }
+
+    // Send CopyDone message ('c')
+    bool SendCopyDone() {
+        std::vector<uint8_t> buf = {'c', 0, 0, 0, 4};
+        return ProcessAndWait(buf);
+    }
+
+    // Send CopyFail message ('f')
+    bool SendCopyFail(const std::string& error_msg = "client cancelled") {
+        std::vector<uint8_t> buf;
+        buf.push_back('f');
+        int32_t length = static_cast<int32_t>(4 + error_msg.size() + 1);
+        WriteInt32(buf, length);
+        WriteString(buf, error_msg);
+        return ProcessAndWait(buf);
+    }
+
     // Send a raw message with arbitrary type (for error handling tests)
     bool SendRawMessage(char type, const std::vector<uint8_t>& body = {}) {
         std::vector<uint8_t> buf;
@@ -329,6 +355,28 @@ public:
             i += 1 + len;
         }
         return count;
+    }
+
+    // Extract all CopyData payloads concatenated
+    std::string GetCopyDataPayload() const {
+        std::string payload;
+        for (size_t i = 0; i < received_data_.size(); ) {
+            char type = static_cast<char>(received_data_[i]);
+            if (i + 5 > received_data_.size()) break;
+            int32_t len;
+            std::memcpy(&len, received_data_.data() + i + 1, 4);
+            len = NetworkToHost32(len);
+
+            if (type == 'd') {
+                // CopyData: payload starts at offset 5, length is (len - 4)
+                int32_t payload_len = len - 4;
+                if (payload_len > 0 && i + 5 + payload_len <= received_data_.size()) {
+                    payload.append(reinterpret_cast<const char*>(received_data_.data() + i + 5), payload_len);
+                }
+            }
+            i += 1 + len;
+        }
+        return payload;
     }
 
     PgConnectionState GetState() const {
@@ -1130,6 +1178,173 @@ void TestUnknownMessageType() {
 }
 
 //===----------------------------------------------------------------------===//
+// COPY Protocol Tests
+//===----------------------------------------------------------------------===//
+
+void TestCopyToStdout() {
+    std::cout << "  Testing COPY TO STDOUT..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    // Create and populate table
+    test.SendQuery("CREATE TABLE copy_src (id INTEGER, name VARCHAR, value DOUBLE)");
+    test.SendQuery("INSERT INTO copy_src VALUES (1, 'Alice', 1.5), (2, 'Bob', 2.7), (3, 'Charlie', 3.14)");
+    test.ClearReceived();
+
+    // COPY TO STDOUT
+    assert(test.SendQuery("COPY copy_src TO STDOUT"));
+
+    // Should have CopyOutResponse ('H'), CopyData ('d'), CopyDone ('c'), CommandComplete ('C'), ReadyForQuery ('Z')
+    assert(test.HasMessageType('H'));  // CopyOutResponse
+    assert(test.HasMessageType('d'));  // CopyData
+    assert(test.HasMessageType('c'));  // CopyDone
+    assert(test.HasMessageType('C'));  // CommandComplete
+    assert(test.HasMessageType('Z'));  // ReadyForQuery
+
+    // Verify command complete tag
+    assert(test.GetCommandCompleteTag() == "COPY 3");
+
+    // Verify CopyData payload contains tab-separated rows
+    std::string payload = test.GetCopyDataPayload();
+    assert(payload.find("Alice") != std::string::npos);
+    assert(payload.find("Bob") != std::string::npos);
+    assert(payload.find("Charlie") != std::string::npos);
+    // Each row should be tab-separated with newline
+    assert(payload.find('\t') != std::string::npos);
+    assert(payload.find('\n') != std::string::npos);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCopyToStdoutSubquery() {
+    std::cout << "  Testing COPY (subquery) TO STDOUT..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    test.SendQuery("CREATE TABLE copy_sub (id INTEGER, name VARCHAR)");
+    test.SendQuery("INSERT INTO copy_sub VALUES (1, 'A'), (2, 'B'), (3, 'C')");
+    test.ClearReceived();
+
+    assert(test.SendQuery("COPY (SELECT * FROM copy_sub WHERE id > 1) TO STDOUT"));
+
+    assert(test.HasMessageType('H'));
+    assert(test.HasMessageType('c'));
+    assert(test.GetCommandCompleteTag() == "COPY 2");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCopyToStdoutWithNull() {
+    std::cout << "  Testing COPY TO STDOUT with NULLs..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    test.SendQuery("CREATE TABLE copy_null (id INTEGER, name VARCHAR)");
+    test.SendQuery("INSERT INTO copy_null VALUES (1, NULL), (NULL, 'hello')");
+    test.ClearReceived();
+
+    assert(test.SendQuery("COPY copy_null TO STDOUT"));
+
+    assert(test.HasMessageType('H'));
+    assert(test.GetCommandCompleteTag() == "COPY 2");
+
+    // Verify NULLs are represented as \N
+    std::string payload = test.GetCopyDataPayload();
+    assert(payload.find("\\N") != std::string::npos);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCopyFromStdin() {
+    std::cout << "  Testing COPY FROM STDIN..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    // Create target table
+    test.SendQuery("CREATE TABLE copy_dst (id INTEGER, name VARCHAR)");
+    test.ClearReceived();
+
+    // Start COPY FROM STDIN
+    assert(test.SendQuery("COPY copy_dst FROM STDIN"));
+
+    // Should have CopyInResponse ('G')
+    assert(test.HasMessageType('G'));
+    test.ClearReceived();
+
+    // Send CSV data rows
+    assert(test.SendCopyData("1\tAlice\n"));
+    assert(test.SendCopyData("2\tBob\n"));
+    assert(test.SendCopyData("3\tCharlie\n"));
+
+    // Send CopyDone
+    assert(test.SendCopyDone());
+
+    // Should have CommandComplete + ReadyForQuery
+    assert(test.HasMessageType('C'));
+    assert(test.HasMessageType('Z'));
+    assert(test.GetCommandCompleteTag() == "COPY 3");
+    test.ClearReceived();
+
+    // Verify data was inserted
+    assert(test.SendQuery("SELECT * FROM copy_dst ORDER BY id"));
+    assert(test.CountDataRows() == 3);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCopyFromStdinFail() {
+    std::cout << "  Testing COPY FROM STDIN with CopyFail..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    test.SendQuery("CREATE TABLE copy_fail_dst (id INTEGER, name VARCHAR)");
+    test.ClearReceived();
+
+    // Start COPY FROM STDIN
+    assert(test.SendQuery("COPY copy_fail_dst FROM STDIN"));
+    assert(test.HasMessageType('G'));
+    test.ClearReceived();
+
+    // Send some data then fail
+    assert(test.SendCopyData("1\tAlice\n"));
+    assert(test.SendCopyFail("client cancelled copy"));
+
+    // Should have ErrorResponse + ReadyForQuery
+    assert(test.HasMessageType('E'));
+    assert(test.HasMessageType('Z'));
+    test.ClearReceived();
+
+    // Verify no data was inserted
+    assert(test.SendQuery("SELECT COUNT(*) FROM copy_fail_dst"));
+    assert(test.CountDataRows() == 1);  // One row with count=0
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestCopyToStdoutEmptyTable() {
+    std::cout << "  Testing COPY TO STDOUT empty table..." << std::endl;
+
+    PgProtocolTest test;
+    test.SendStartup();
+
+    test.SendQuery("CREATE TABLE copy_empty (id INTEGER, name VARCHAR)");
+    test.ClearReceived();
+
+    assert(test.SendQuery("COPY copy_empty TO STDOUT"));
+
+    assert(test.HasMessageType('H'));
+    assert(test.HasMessageType('c'));
+    assert(test.GetCommandCompleteTag() == "COPY 0");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -1193,6 +1408,14 @@ int main() {
 
     std::cout << "\n10. Unknown Message Type:" << std::endl;
     TestUnknownMessageType();
+
+    std::cout << "\n11. COPY Protocol:" << std::endl;
+    TestCopyToStdout();
+    TestCopyToStdoutSubquery();
+    TestCopyToStdoutWithNull();
+    TestCopyFromStdin();
+    TestCopyFromStdinFail();
+    TestCopyToStdoutEmptyTable();
 
     std::cout << "\n=== All integration tests PASSED ===" << std::endl;
     return 0;
