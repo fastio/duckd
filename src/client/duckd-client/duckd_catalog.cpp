@@ -35,6 +35,7 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "duckdb/main/config.hpp"
 
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/physical_operator.hpp"
@@ -1167,7 +1168,12 @@ static LogicalType TypeFromInfoSchemaString(const string &data_type,
     if (type_id != LogicalTypeId::INVALID && type_id != LogicalTypeId::ANY) {
         return LogicalType(type_id);
     }
-    // Fallback: complex or unknown type (LIST, STRUCT, MAP, …) — surface as VARCHAR.
+    // Complex types (LIST, STRUCT, MAP, ARRAY, UNION, …) — parse the full type string.
+    try {
+        return DBConfig::ParseLogicalType(data_type);
+    } catch (...) {
+    }
+    // Last resort: surface as VARCHAR.
     return LogicalType::VARCHAR;
 }
 
@@ -1351,9 +1357,20 @@ void DuckdSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 }
 
 void DuckdSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-    throw NotImplementedException(
-        "duckd: ALTER is not supported via the remote catalog. "
-        "Use duckd_exec(url, sql) to run ALTER statements directly.");
+    // Serialize the ALTER to SQL, stripping the local catalog prefix so the
+    // statement is valid on the remote server.
+    auto copy = info.Copy();
+    copy->catalog.clear();
+    string sql = copy->ToString();
+
+    auto result = client_->ExecuteUpdate(sql);
+    if (!result.ok()) {
+        throw IOException("duckd: ALTER failed: " + result.status().ToString());
+    }
+    // Invalidate caches so subsequent reads pick up the altered schema.
+    std::lock_guard<std::mutex> lock(entry_mutex_);
+    table_cache_.erase(info.name);
+    cache_populated_ = false;
 }
 
 // Unsupported object types
