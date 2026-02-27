@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">DuckD</h1>
   <p align="center">
-    <strong>Deploy DuckDB as a server-side analytical database.<br>PostgreSQL-compatible. Arrow Flight SQL native. Zero migration cost.</strong>
+    <strong>Deploy DuckDB as a server-side analytical database.<br>PostgreSQL-compatible. DuckDB native SDK. Zero migration cost.</strong>
   </p>
   <p align="center">
     <a href="#quick-start">Quick Start</a> &middot;
