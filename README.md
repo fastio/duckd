@@ -1,10 +1,11 @@
 <p align="center">
   <h1 align="center">DuckD</h1>
   <p align="center">
-    <strong>Turn DuckDB into a multi-user server — zero config, PostgreSQL-compatible.</strong>
+    <strong>Deploy DuckDB as a server-side analytical database.<br>PostgreSQL-compatible. Arrow Flight SQL native. Zero migration cost.</strong>
   </p>
   <p align="center">
     <a href="#quick-start">Quick Start</a> &middot;
+    <a href="#how-it-connects">How It Connects</a> &middot;
     <a href="#usage-examples">Examples</a> &middot;
     <a href="#configuration">Configuration</a> &middot;
     <a href="#architecture">Architecture</a>
@@ -13,26 +14,77 @@
 
 ---
 
-DuckD is a lightweight network server that wraps [DuckDB](https://duckdb.org) with the **PostgreSQL wire protocol** (v3) and optionally **Arrow Flight SQL** (gRPC). Any PostgreSQL client — `psql`, Python, Node.js, Java, Go, BI tools — can connect and query DuckDB over the network without code changes.
+## What is DuckD?
+
+[DuckDB](https://duckdb.org) is the fastest-growing embedded analytical database — but "embedded" means it lives inside a single process. You can't deploy it behind an API, share it across a team, or plug it into BI tools that need a network endpoint.
+
+**DuckD turns DuckDB into a deployable backend service.** It wraps DuckDB with production-grade network protocols and exposes it as a multi-user server that can be deployed, managed, and monitored like any backend infrastructure.
 
 ```bash
-./duckd-server                                      # start (in-memory, port 5432)
-psql -h localhost -p 5432 -U any -d any             # connect with any PG client
+./duckd-server --database /data/warehouse.duckdb    # deploy as a backend service
+psql -h analytics.internal -p 5432 -U any -d any    # connect from any PG client
 
 => SELECT * FROM read_parquet('s3://bucket/sales/*.parquet');
 ```
 
-## Why DuckD?
+## The Problem
 
-DuckDB is a blazing-fast embedded analytical database, but it runs inside a single process. This makes it hard to share with a team, connect BI tools, or run as a long-lived service. DuckD solves this:
+DuckDB has redefined single-node analytical performance, but bringing it into production backend architectures means hitting the same walls:
 
-| Problem | DuckD Solution |
-|---------|----------------|
-| DuckDB is single-process, single-user | Multi-client server with concurrent connections |
-| BI tools need a network endpoint | Speaks standard PostgreSQL protocol — works out of the box |
-| No way to query remote DuckDB instances | Client extension lets you `ATTACH` remote servers for federated queries |
-| Moving large datasets is slow | Arrow Flight SQL streams columnar data at near-zero serialization cost |
-| Need a data warehouse but it's overkill | Lightweight OLAP server — single binary, no JVM, no cluster |
+- **No network access.** DuckDB runs in-process. Your backend services, BI dashboards, and data pipelines can't reach it over the network.
+- **Single-process, single-user.** Multiple services or team members can't query the same DuckDB concurrently.
+- **No deployment story.** There's no standard way to run DuckDB as a long-lived, managed backend service with health checks, metrics, and graceful lifecycle management.
+- **Integration friction.** Adopting DuckDB in existing architectures typically means rewriting data access layers to use a DuckDB-specific SDK.
+
+## How DuckD Solves It
+
+DuckD exposes DuckDB through two complementary network protocols, designed so that **existing applications require near-zero code changes** to connect:
+
+### PostgreSQL Wire Protocol — universal compatibility
+
+DuckD implements the **PostgreSQL wire protocol v3** (the same binary protocol that PostgreSQL has used since 8.0). This means:
+
+- **Every PostgreSQL client works out of the box** — `psql`, `psycopg2`, `pg` (Node.js), JDBC, `pgx` (Go), and hundreds more.
+- **Every BI tool works** — Metabase, Tableau, Grafana, DBeaver, DataGrip, Superset — just point them at `host:5432`.
+- **Existing applications need zero code changes.** If your app talks to PostgreSQL, it can talk to DuckD. Change the connection string, keep everything else.
+- Full support: simple & extended query, prepared statements with parameters, transactions, `COPY TO/FROM`, query cancellation.
+
+### DuckDB Native SDK — zero-copy columnar access
+
+For workloads that need maximum throughput, DuckD also serves **Arrow Flight SQL** (gRPC). This unlocks:
+
+- **Native DuckDB extension** — `ATTACH 'grpc://host:port'` from any DuckDB instance. Query remote tables as if they were local. Join local and remote data. Federate across multiple DuckD servers.
+- **Arrow-native data transfer** — columnar data flows over the wire in Apache Arrow format with near-zero serialization cost. Ideal for data science workloads and large result sets.
+- **`duckd_query()` / `duckd_exec()`** — table functions that let a local DuckDB execute SQL on a remote DuckD and consume the results natively.
+
+### Together: two protocols, one server
+
+```
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  Your existing infrastructure                                         │
+    │                                                                       │
+    │  psql, JDBC, psycopg2,          DuckDB instances,                     │
+    │  Metabase, Grafana, ...         pyarrow, ADBC, ...                    │
+    │         │                              │                              │
+    │         │ PostgreSQL protocol           │ Arrow Flight SQL (gRPC)      │
+    │         │ (zero code changes)           │ (native columnar)            │
+    └─────────┼──────────────────────────────┼──────────────────────────────┘
+              ▼                              ▼
+        ┌──────────────────────────────────────────┐
+        │              DuckD Server                │
+        │                                          │
+        │   TCP :5432            gRPC :8815         │
+        │   PG handler           Flight SQL        │
+        │         └──────┬───────────┘             │
+        │                ▼                         │
+        │          ExecutorPool                    │
+        │          SessionManager ──► DuckDB       │
+        │                                          │
+        │   HTTP :8080  /health  /metrics          │
+        └──────────────────────────────────────────┘
+```
+
+PostgreSQL protocol gives you **instant compatibility** with the entire database ecosystem. Arrow Flight SQL gives you **native DuckDB power** at wire speed. Same server, same data, pick the right protocol for each client.
 
 ## Features
 
@@ -44,9 +96,9 @@ DuckDB is a blazing-fast embedded analytical database, but it runs inside a sing
 | | **Query Cancellation** | `Ctrl-C` in psql propagates to DuckDB's interrupt mechanism |
 | | **Query Timeout** | Configurable per-server, kills runaway queries |
 | | **Arrow Flight SQL** | High-throughput gRPC interface for columnar data transfer (opt-in) |
-| | **Client Extension** | `ATTACH 'grpc://host:port'` — federated queries from any DuckDB instance |
+| | **DuckDB Client Extension** | `ATTACH 'grpc://host:port'` — federated queries from any DuckDB instance |
 | | **Health & Metrics** | HTTP `/health` + Prometheus `/metrics` endpoint |
-| | **Production Ready** | Daemon mode, privilege dropping, PID files, `SIGHUP` reload |
+| | **Backend Deployment** | Daemon mode, privilege dropping, PID files, `SIGHUP` hot-reload |
 | | **systemd** | `Type=notify` integration with watchdog support (Linux) |
 
 > **Note:** DuckD does not yet implement authentication or TLS. Deploy behind a firewall or use a TLS-terminating proxy (Nginx, HAProxy, stunnel) for network-exposed deployments.
@@ -110,9 +162,9 @@ SELECT * FROM read_csv('/data/report.csv', header=true, delim='|');
 CREATE TABLE events AS SELECT * FROM read_parquet('/data/events/**/*.parquet');
 ```
 
-### Connect from any language
+### Connect from any language — zero code changes
 
-DuckD speaks standard PostgreSQL — use your existing driver:
+DuckD speaks standard PostgreSQL. Switch the connection string, keep everything else:
 
 <details>
 <summary><b>psql</b></summary>
@@ -252,11 +304,12 @@ except Exception:
     raise
 ```
 
-### Arrow Flight SQL — high-throughput columnar access
+### Arrow Flight SQL — native columnar access
 
-Start the server with Flight SQL enabled for near-zero-copy data transfer over gRPC:
+For data-intensive workloads where row-by-row PG protocol is a bottleneck, enable Arrow Flight SQL. Data flows in Apache Arrow columnar format with near-zero serialization cost:
 
 ```bash
+# Start server with both protocols
 ./duckd-server --port 5432 --flight-port 8815 --http-port 8080
 ```
 
@@ -277,34 +330,36 @@ df = table.to_pandas()               # Convert to Pandas
 print(df.describe())
 ```
 
-### Federated queries with the DuckDB client extension
+### DuckDB native SDK — federated queries
 
-The `duckd-client` extension (built with `-DWITH_FLIGHT_SQL=ON`) lets any DuckDB instance transparently ATTACH a remote DuckD server. Query remote tables as if they were local and join across multiple data sources:
+The `duckd-client` extension (built with `-DWITH_FLIGHT_SQL=ON`) is a **native DuckDB extension** that lets any DuckDB instance treat a remote DuckD server as a local database. No protocol translation, no row-by-row conversion — data moves between DuckDB instances in native Arrow columnar format.
+
+**ATTACH remote servers like local databases:**
 
 ```sql
 LOAD duckd_client;
 
--- Attach a remote DuckD server
+-- Attach a remote DuckD server — it shows up as a regular catalog
 ATTACH 'grpc://analytics-server:8815' AS warehouse (TYPE duckd);
 
--- Query remote tables transparently
+-- Query remote tables with native DuckDB syntax
 SELECT * FROM warehouse.main.sales WHERE region = 'APAC' AND year = 2024;
 
--- Join local and remote data — the optimizer pushes filters to the remote side
+-- Join local and remote data seamlessly
 SELECT o.order_id, o.total, c.name, c.tier
 FROM local_orders o
 JOIN warehouse.main.customers c ON o.customer_id = c.id
 WHERE c.tier = 'enterprise';
 ```
 
-Execute DDL/DML on remote servers:
+**Execute DDL/DML on remote servers:**
 
 ```sql
 -- duckd_exec: run statements, returns affected row count
 SELECT duckd_exec('grpc://server:8815', 'CREATE TABLE logs (ts TIMESTAMP, msg VARCHAR)');
 SELECT duckd_exec('grpc://server:8815', 'INSERT INTO logs VALUES (now(), ''deployed v2.1'')');
 
--- duckd_query: run a query, returns results as a table function
+-- duckd_query: run a query, returns results as a DuckDB table function
 SELECT * FROM duckd_query('grpc://server:8815',
     'SELECT dept, COUNT(*) as cnt, AVG(salary) as avg_sal
      FROM employees GROUP BY dept ORDER BY avg_sal DESC');
@@ -527,7 +582,7 @@ docker run -d --name duckd \
 
 - **Sticky sessions.** Each network connection owns a dedicated DuckDB connection for its lifetime. Transactions, prepared statements, and temp tables are naturally scoped — no cross-connection leakage.
 - **Async I/O, sync execution.** Network I/O is non-blocking (ASIO). Queries are submitted to a fixed-size executor pool via a lock-free concurrent queue (moodycamel), keeping I/O threads responsive under heavy query load.
-- **Dual protocol.** The PostgreSQL protocol provides universal compatibility; Arrow Flight SQL adds a high-throughput binary path for analytics workloads that need columnar data at wire speed.
+- **Dual protocol.** PostgreSQL protocol for universal ecosystem compatibility (existing apps, BI tools — zero code changes); Arrow Flight SQL for native DuckDB SDK access and high-throughput columnar transfer.
 - **Zero external dependencies at runtime.** Single static binary. No JVM, no Python, no cluster coordinator.
 
 ### Source layout
