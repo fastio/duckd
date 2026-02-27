@@ -106,6 +106,9 @@ public:
     TableStorageInfo GetStorageInfo(ClientContext &context) override;
     unique_ptr<CatalogEntry> Copy(ClientContext &context) const override;
 
+    // Estimated row count (set during PopulateTableCache, 0 = unknown).
+    idx_t estimated_cardinality = 0;
+
 private:
     string url_;
     string schema_name_;

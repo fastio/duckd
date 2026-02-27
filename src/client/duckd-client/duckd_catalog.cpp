@@ -22,12 +22,18 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/table_filter.hpp"
@@ -555,6 +561,57 @@ static string QuoteIdentifier(const string &name) {
 }
 
 //===----------------------------------------------------------------------===//
+// Utilities: Extract WHERE clause from a bound logical operator tree
+//===----------------------------------------------------------------------===//
+
+// Recursively serialize a bound Expression tree to SQL text.
+// BoundColumnRefExpression uses its alias (= column name) wrapped in quotes.
+// Falls back to Expression::ToString() for unknown expression types.
+static string BoundExprToSQL(const Expression &expr) {
+    switch (expr.GetExpressionClass()) {
+        case ExpressionClass::BOUND_COLUMN_REF: {
+            auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+            if (!col_ref.alias.empty()) {
+                return QuoteIdentifier(col_ref.alias);
+            }
+            return expr.ToString();
+        }
+        case ExpressionClass::BOUND_CONSTANT: {
+            auto &cnst = expr.Cast<BoundConstantExpression>();
+            return cnst.value.ToSQLString();
+        }
+        default:
+            // For comparison, conjunction, function, cast, etc. — use the
+            // built-in ToString() which produces valid SQL for most cases.
+            // Column refs inside these are typically aliased, so the output
+            // will contain column names rather than binding indices.
+            return expr.ToString();
+    }
+}
+
+// Walk the logical operator tree rooted at `op` to find LogicalFilter nodes.
+// Returns the WHERE clause as a SQL string, or "" if no filter exists.
+static string ExtractWhereClause(const LogicalOperator &op) {
+    if (op.type == LogicalOperatorType::LOGICAL_FILTER) {
+        // Filter expressions are AND-separated predicates.
+        vector<string> parts;
+        for (auto &expr : op.expressions) {
+            string s = BoundExprToSQL(*expr);
+            if (!s.empty()) {
+                parts.push_back(s);
+            }
+        }
+        return parts.empty() ? "" : StringUtil::Join(parts, " AND ");
+    }
+    // Recurse into children (e.g. LogicalProjection wrapping a LogicalFilter).
+    for (auto &child : op.children) {
+        string w = ExtractWhereClause(*child);
+        if (!w.empty()) return w;
+    }
+    return "";
+}
+
+//===----------------------------------------------------------------------===//
 // Utilities: TableFilter → SQL WHERE fragment
 //===----------------------------------------------------------------------===//
 
@@ -633,6 +690,69 @@ static string FilterToSQL(const TableFilter &filter, const string &col_name) {
 }
 
 //===----------------------------------------------------------------------===//
+// PhysicalDuckdDML – source-only operator that forwards DELETE/UPDATE SQL
+//
+// This operator does not consume child plan output.  Instead, the complete
+// remote SQL statement (including WHERE clause) is built at plan time from
+// the logical operator tree and executed when GetData() is first called.
+//===----------------------------------------------------------------------===//
+
+struct DuckdDMLSourceState : public GlobalSourceState {
+    bool executed = false;
+    int64_t affected_rows = 0;
+};
+
+class PhysicalDuckdDML : public PhysicalOperator {
+public:
+    PhysicalDuckdDML(PhysicalPlan &plan, LogicalOperator &op,
+                     string sql,
+                     std::shared_ptr<duckdb_client::DuckdFlightClient> client,
+                     Catalog &catalog)
+        : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION,
+                           {LogicalType::BIGINT}, op.estimated_cardinality)
+        , sql_(std::move(sql))
+        , client_(std::move(client))
+        , catalog_(catalog) {}
+
+    bool IsSource() const override { return true; }
+
+    unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &) const override {
+        return make_uniq<DuckdDMLSourceState>();
+    }
+
+    SourceResultType GetDataInternal(ExecutionContext &ctx, DataChunk &chunk,
+                                     OperatorSourceInput &input) const override {
+        auto &state = input.global_state.Cast<DuckdDMLSourceState>();
+        if (state.executed) {
+            return SourceResultType::FINISHED;
+        }
+        state.executed = true;
+
+        // Execute within the active transaction if one exists.
+        arrow::Result<int64_t> result;
+        auto &duckd_txn = Transaction::Get(ctx.client, catalog_).Cast<DuckdTransaction>();
+        if (duckd_txn.HasFlightTxn()) {
+            result = client_->ExecuteUpdate(sql_, duckd_txn.FlightTxn());
+        } else {
+            result = client_->ExecuteUpdate(sql_);
+        }
+
+        if (!result.ok()) {
+            throw IOException("duckd: DML failed: " + result.status().ToString());
+        }
+        state.affected_rows = result.ValueUnsafe();
+        chunk.SetCardinality(1);
+        chunk.SetValue(0, 0, Value::BIGINT(state.affected_rows));
+        return SourceResultType::FINISHED;
+    }
+
+private:
+    string                                              sql_;
+    std::shared_ptr<duckdb_client::DuckdFlightClient>   client_;
+    Catalog                                            &catalog_;
+};
+
+//===----------------------------------------------------------------------===//
 // PhysicalDuckdInsert – physical operator that forwards INSERT to remote duckd
 //
 // Implements the sink+source pattern used by DuckDB DML operators:
@@ -669,6 +789,9 @@ public:
 
     bool IsSink()   const override { return true;  }
     bool IsSource() const override { return true;  }
+
+    // If non-empty, executed before the INSERT (used by CTAS).
+    string create_sql;
 
     // ── Sink interface ──────────────────────────────────────────────────────
 
@@ -717,6 +840,16 @@ public:
     SinkFinalizeType Finalize(Pipeline &, Event &, ClientContext &ctx,
                               OperatorSinkFinalizeInput &input) const override {
         auto &gstate = input.global_state.Cast<DuckdInsertSinkState>();
+
+        // CTAS: create the table on the remote server first.
+        if (!create_sql.empty()) {
+            auto create_result = client_->ExecuteUpdate(create_sql);
+            if (!create_result.ok()) {
+                throw IOException("duckd: CREATE TABLE failed: " +
+                                  create_result.status().ToString());
+            }
+        }
+
         if (gstate.sql_values.empty()) {
             return SinkFinalizeType::READY; // nothing to insert
         }
@@ -1041,7 +1174,9 @@ TableFunction DuckdTableEntry::GetScanFunction(ClientContext &context,
 
 TableStorageInfo DuckdTableEntry::GetStorageInfo(ClientContext &) {
     TableStorageInfo info;
-    info.cardinality = optional_idx(); // unknown
+    info.cardinality = estimated_cardinality > 0
+                           ? optional_idx(estimated_cardinality)
+                           : optional_idx();
     return info;
 }
 
@@ -1210,7 +1345,7 @@ void DuckdSchemaEntry::PopulateTableCache() {
     }
 
     // Build a CreateTableInfo per table from the columnar result.
-    struct Builder { CreateTableInfo info; };
+    struct Builder { CreateTableInfo info; idx_t estimated_rows = 0; };
     std::unordered_map<string, Builder> builders;
 
     for (auto &batch : res.ValueUnsafe().batches) {
@@ -1254,6 +1389,32 @@ void DuckdSchemaEntry::PopulateTableCache() {
         }
     }
 
+    // Fetch estimated row counts from duckdb_tables() — best effort.
+    {
+        string card_sql =
+            "SELECT table_name, estimated_size FROM duckdb_tables() "
+            "WHERE schema_name = '" + escaped + "'";
+        auto card_res = client_->ExecuteQuery(card_sql);
+        if (card_res.ok()) {
+            for (auto &batch : card_res.ValueUnsafe().batches) {
+                if (batch->num_columns() < 2) continue;
+                auto &tn_col = static_cast<const arrow::StringArray &>(*batch->column(0));
+                for (int64_t row = 0; row < batch->num_rows(); row++) {
+                    if (tn_col.IsNull(row)) continue;
+                    string tname = tn_col.GetString(row);
+                    auto it = builders.find(tname);
+                    if (it == builders.end()) continue;
+                    auto &arr = *batch->column(1);
+                    if (arr.IsNull(row)) continue;
+                    if (arr.type_id() == arrow::Type::INT64) {
+                        it->second.estimated_rows = static_cast<idx_t>(
+                            static_cast<const arrow::Int64Array &>(arr).Value(row));
+                    }
+                }
+            }
+        }
+    }
+
     // --- Write phase: acquire lock, double-check, populate ----------------
     std::lock_guard<std::mutex> lk(entry_mutex_);
     if (cache_populated_) return; // another thread beat us to it
@@ -1262,8 +1423,10 @@ void DuckdSchemaEntry::PopulateTableCache() {
 
     for (auto &[tname, bld] : builders) {
         if (!table_cache_.count(tname)) {
-            table_cache_[tname] = make_uniq<DuckdTableEntry>(
+            auto entry = make_uniq<DuckdTableEntry>(
                 catalog, *this, bld.info, url_, name, client_);
+            entry->estimated_cardinality = bld.estimated_rows;
+            table_cache_[tname] = std::move(entry);
         }
     }
 }
@@ -1536,11 +1699,38 @@ void DuckdCatalog::DropSchema(ClientContext &context, DropInfo &info) {
     schema_cache_.erase(info.name);
 }
 
-PhysicalOperator &DuckdCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &,
-                                                   LogicalCreateTable &, PhysicalOperator &) {
-    throw NotImplementedException(
-        "duckd: CREATE TABLE AS SELECT is not supported via the remote catalog. "
-        "Use duckd_exec(url, 'CREATE TABLE AS SELECT ...') instead.");
+PhysicalOperator &DuckdCatalog::PlanCreateTableAs(ClientContext &ctx, PhysicalPlanGenerator &planner,
+                                                   LogicalCreateTable &op, PhysicalOperator &plan) {
+    auto &create_info = op.info->Base();
+
+    // Build column names from the child plan's output types (the SELECT columns).
+    vector<string> col_names;
+    for (auto &col : create_info.columns.Physical()) {
+        col_names.push_back(col.Name());
+    }
+
+    // Build CREATE TABLE SQL.
+    string schema_name = create_info.schema;
+    string table_name  = create_info.table;
+
+    string create_sql = "CREATE TABLE ";
+    if (create_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
+        create_sql += "IF NOT EXISTS ";
+    }
+    create_sql += QuoteIdentifier(schema_name) + "." + QuoteIdentifier(table_name) + " (";
+    bool first = true;
+    for (auto &col : create_info.columns.Physical()) {
+        if (!first) create_sql += ", ";
+        first = false;
+        create_sql += QuoteIdentifier(col.Name()) + " " + col.Type().ToString();
+    }
+    create_sql += ")";
+
+    auto &phys_op = planner.Make<PhysicalDuckdInsert>(
+        op, schema_name, table_name, std::move(col_names), client_, *this);
+    phys_op.children.push_back(plan);
+    static_cast<PhysicalDuckdInsert &>(phys_op).create_sql = std::move(create_sql);
+    return phys_op;
 }
 
 PhysicalOperator &DuckdCatalog::PlanInsert(ClientContext &ctx, PhysicalPlanGenerator &planner,
@@ -1581,18 +1771,79 @@ PhysicalOperator &DuckdCatalog::PlanInsert(ClientContext &ctx, PhysicalPlanGener
     return insert_op;
 }
 
-PhysicalOperator &DuckdCatalog::PlanDelete(ClientContext &, PhysicalPlanGenerator &,
-                                            LogicalDelete &, PhysicalOperator &) {
-    throw NotImplementedException(
-        "duckd: DELETE via the remote catalog is not supported. "
-        "Use duckd_exec(url, 'DELETE FROM ...') for DML operations.");
+PhysicalOperator &DuckdCatalog::PlanDelete(ClientContext &ctx, PhysicalPlanGenerator &planner,
+                                            LogicalDelete &op, PhysicalOperator &plan) {
+    if (op.return_chunk) {
+        throw NotImplementedException(
+            "DELETE ... RETURNING is not supported for remote duckd tables");
+    }
+
+    auto &duck_table = op.table.Cast<DuckdTableEntry>();
+    string schema_name = duck_table.schema.name;
+    string table_name  = duck_table.name;
+
+    string sql = "DELETE FROM " + QuoteIdentifier(schema_name) +
+                 "." + QuoteIdentifier(table_name);
+
+    // Extract WHERE clause from the logical operator tree.
+    if (!op.children.empty()) {
+        string where_clause = ExtractWhereClause(*op.children[0]);
+        if (!where_clause.empty()) {
+            sql += " WHERE " + where_clause;
+        }
+    }
+
+    return planner.Make<PhysicalDuckdDML>(op, std::move(sql), client_, *this);
 }
 
-PhysicalOperator &DuckdCatalog::PlanUpdate(ClientContext &, PhysicalPlanGenerator &,
-                                            LogicalUpdate &, PhysicalOperator &) {
-    throw NotImplementedException(
-        "duckd: UPDATE via the remote catalog is not supported. "
-        "Use duckd_exec(url, 'UPDATE ...') for DML operations.");
+PhysicalOperator &DuckdCatalog::PlanUpdate(ClientContext &ctx, PhysicalPlanGenerator &planner,
+                                            LogicalUpdate &op, PhysicalOperator &plan) {
+    if (op.return_chunk) {
+        throw NotImplementedException(
+            "UPDATE ... RETURNING is not supported for remote duckd tables");
+    }
+
+    auto &duck_table = op.table.Cast<DuckdTableEntry>();
+    string schema_name = duck_table.schema.name;
+    string table_name  = duck_table.name;
+
+    // Build SET clause from LogicalUpdate.columns and the SET expressions
+    // in the child LogicalProjection.
+    string set_clause;
+    auto &columns = duck_table.GetColumns();
+
+    // The child of LogicalUpdate is a LogicalProjection whose first N
+    // expressions are the SET values (same order as op.columns).
+    LogicalProjection *proj = nullptr;
+    if (!op.children.empty() &&
+        op.children[0]->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+        proj = &op.children[0]->Cast<LogicalProjection>();
+    }
+
+    for (idx_t i = 0; i < op.columns.size(); i++) {
+        if (i > 0) set_clause += ", ";
+        auto &col = columns.GetColumn(op.columns[i]);
+        set_clause += QuoteIdentifier(col.Name()) + " = ";
+        if (proj && i < proj->expressions.size()) {
+            set_clause += BoundExprToSQL(*proj->expressions[i]);
+        } else {
+            set_clause += "DEFAULT";
+        }
+    }
+
+    string sql = "UPDATE " + QuoteIdentifier(schema_name) +
+                 "." + QuoteIdentifier(table_name) +
+                 " SET " + set_clause;
+
+    // Extract WHERE clause — it's inside the projection's child subtree.
+    if (!op.children.empty()) {
+        string where_clause = ExtractWhereClause(*op.children[0]);
+        if (!where_clause.empty()) {
+            sql += " WHERE " + where_clause;
+        }
+    }
+
+    return planner.Make<PhysicalDuckdDML>(op, std::move(sql), client_, *this);
 }
 
 DatabaseSize DuckdCatalog::GetDatabaseSize(ClientContext &) {
