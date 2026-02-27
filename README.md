@@ -1,227 +1,183 @@
-# DuckD
+<p align="center">
+  <h1 align="center">DuckD</h1>
+  <p align="center">
+    <strong>Turn DuckDB into a multi-user server — zero config, PostgreSQL-compatible.</strong>
+  </p>
+  <p align="center">
+    <a href="#quick-start">Quick Start</a> &middot;
+    <a href="#usage-examples">Examples</a> &middot;
+    <a href="#configuration">Configuration</a> &middot;
+    <a href="#architecture">Architecture</a>
+  </p>
+</p>
 
-A network server for [DuckDB](https://duckdb.org) that speaks the PostgreSQL wire protocol (v3), enabling any PostgreSQL-compatible client to connect to a shared DuckDB instance. Optionally also serves [Arrow Flight SQL](https://arrow.apache.org/docs/format/FlightSql.html) for high-throughput columnar data access.
+---
 
+DuckD is a lightweight network server that wraps [DuckDB](https://duckdb.org) with the **PostgreSQL wire protocol** (v3) and optionally **Arrow Flight SQL** (gRPC). Any PostgreSQL client — `psql`, Python, Node.js, Java, Go, BI tools — can connect and query DuckDB over the network without code changes.
+
+```bash
+./duckd-server                                      # start (in-memory, port 5432)
+psql -h localhost -p 5432 -U any -d any             # connect with any PG client
+
+=> SELECT * FROM read_parquet('s3://bucket/sales/*.parquet');
 ```
-psql -h localhost -p 5432 -U any -d any
-```
 
-## Why
+## Why DuckD?
 
-DuckDB is an embedded database — it runs inside a single process. DuckD exposes it as a standalone server so multiple clients can share one database over standard network protocols.
+DuckDB is a blazing-fast embedded analytical database, but it runs inside a single process. This makes it hard to share with a team, connect BI tools, or run as a long-lived service. DuckD solves this:
 
-**Use cases:**
-- Shared analytics backend for BI tools (Metabase, Tableau, DBeaver, Grafana)
-- Query Parquet / CSV / JSON files remotely via SQL
-- Lightweight OLAP service without deploying a heavy data warehouse
-- Federated queries across remote DuckDB instances via the client extension
-- Development / staging analytics environment with multi-user access
+| Problem | DuckD Solution |
+|---------|----------------|
+| DuckDB is single-process, single-user | Multi-client server with concurrent connections |
+| BI tools need a network endpoint | Speaks standard PostgreSQL protocol — works out of the box |
+| No way to query remote DuckDB instances | Client extension lets you `ATTACH` remote servers for federated queries |
+| Moving large datasets is slow | Arrow Flight SQL streams columnar data at near-zero serialization cost |
+| Need a data warehouse but it's overkill | Lightweight OLAP server — single binary, no JVM, no cluster |
 
 ## Features
 
-| Feature | Status |
-|---------|--------|
-| PostgreSQL wire protocol v3 | ✅ |
-| Simple and extended query protocol | ✅ |
-| Prepared statements with parameters | ✅ |
-| Transactions (BEGIN / COMMIT / ROLLBACK) | ✅ |
-| COPY protocol (TO STDOUT / FROM STDIN) | ✅ |
-| Query cancellation | ✅ |
-| Configurable query timeout | ✅ |
-| HTTP health check & Prometheus metrics | ✅ |
-| Arrow Flight SQL (gRPC) | ✅ (opt-in) |
-| DuckDB client extension (ATTACH remote) | ✅ (opt-in) |
-| Daemon mode + privilege dropping | ✅ |
-| systemd integration (Type=notify) | ✅ (Linux) |
-| SIGHUP config reload | ✅ |
-| SSL/TLS | planned |
-| Authentication | planned (trust only) |
+| | Feature | Details |
+|-|---------|---------|
+| | **PostgreSQL Protocol v3** | Simple & extended query, prepared statements, parameters, portals |
+| | **Transactions** | `BEGIN` / `COMMIT` / `ROLLBACK` with full DuckDB ACID semantics |
+| | **COPY Protocol** | `COPY TO STDOUT`, `COPY FROM STDIN` — bulk import/export via `\copy` |
+| | **Query Cancellation** | `Ctrl-C` in psql propagates to DuckDB's interrupt mechanism |
+| | **Query Timeout** | Configurable per-server, kills runaway queries |
+| | **Arrow Flight SQL** | High-throughput gRPC interface for columnar data transfer (opt-in) |
+| | **Client Extension** | `ATTACH 'grpc://host:port'` — federated queries from any DuckDB instance |
+| | **Health & Metrics** | HTTP `/health` + Prometheus `/metrics` endpoint |
+| | **Production Ready** | Daemon mode, privilege dropping, PID files, `SIGHUP` reload |
+| | **systemd** | `Type=notify` integration with watchdog support (Linux) |
 
-> **Security note:** DuckD currently does not implement authentication or TLS. Deploy behind a firewall or use a TLS-terminating proxy (e.g. stunnel, Nginx, HAProxy) for network-exposed deployments.
+> **Note:** DuckD does not yet implement authentication or TLS. Deploy behind a firewall or use a TLS-terminating proxy (Nginx, HAProxy, stunnel) for network-exposed deployments.
 
 ## Quick Start
 
 ```bash
-# Clone with submodules
-git clone --recursive https://github.com/jian-fang/duckd.git
-cd duckd
+# Clone
+git clone --recursive https://github.com/jian-fang/duckd.git && cd duckd
 
 # Build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# Run (in-memory database, default port 5432)
+# Run
 ./build/programs/server/duckd-server
 
-# Connect with any PostgreSQL client
+# Connect (any username/database accepted)
 psql -h localhost -p 5432 -U any -d any
 ```
 
-## Building
+That's it. No config files, no setup, no dependencies to install at runtime.
 
-**Requirements:** CMake >= 3.16, C++17 compiler, Git. All dependencies are vendored in `contrib/` as submodules.
+### Build Options
 
 ```bash
-# Release build
+# Standard build
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# With Arrow Flight SQL support
+# With Arrow Flight SQL + client extension
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DWITH_FLIGHT_SQL=ON
 cmake --build build -j$(nproc)
 
-# With systemd integration (Linux)
+# With systemd support (Linux)
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DWITH_SYSTEMD=ON
-cmake --build build -j$(nproc)
-
-# Debug build
-cmake -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build -j$(nproc)
 
 # Run tests
 ctest --test-dir build --output-on-failure
 ```
 
+**Requirements:** CMake >= 3.16, C++17 compiler, Git. All dependencies are vendored in `contrib/` — no system packages needed.
+
 ## Usage Examples
 
-### 1. In-Memory Analytics Server
+### Query files over the network
 
-Spin up a shared in-memory DuckDB that multiple users can query concurrently:
-
-```bash
-./duckd-server --port 5432 --http-port 8080
-```
+Connect from any PostgreSQL client and query files the server has access to — Parquet, CSV, JSON, and even remote files on S3 or HTTP:
 
 ```sql
--- Any user can connect and create tables from files
-psql -h localhost -p 5432 -U analyst -d analytics
-
-CREATE TABLE sales AS SELECT * FROM read_parquet('/data/sales_2024.parquet');
-CREATE TABLE users AS SELECT * FROM read_csv('/data/users.csv');
-
-SELECT u.name, SUM(s.amount) AS total
-FROM sales s JOIN users u ON s.user_id = u.id
-GROUP BY u.name ORDER BY total DESC LIMIT 10;
-```
-
-### 2. Persistent Database Server
-
-Run DuckD as a long-running service with a persistent database file:
-
-```bash
-./duckd-server \
-  --database /var/lib/duckd/warehouse.duckdb \
-  --port 5432 \
-  --http-port 8080 \
-  --executor-threads 8 \
-  --max-connections 200 \
-  --query-timeout 600000 \
-  --log-file /var/log/duckd/duckd.log \
-  --log-level info
-```
-
-### 3. Query Parquet / CSV Files Remotely
-
-Connect from any PG client and query files the server can access:
-
-```sql
--- Directly query Parquet files (no table creation needed)
+-- Parquet (local, glob, remote)
 SELECT * FROM read_parquet('/data/events/*.parquet') WHERE event_date >= '2024-01-01';
+SELECT * FROM read_parquet('s3://my-bucket/sales/**/*.parquet');
+SELECT * FROM read_parquet('https://example.com/dataset.parquet');
 
--- Query CSV with options
+-- CSV with options
 SELECT * FROM read_csv('/data/report.csv', header=true, delim='|');
 
--- Query remote files (S3, HTTP)
-SELECT * FROM read_parquet('s3://my-bucket/data/sales.parquet');
-SELECT * FROM read_parquet('https://example.com/data.parquet');
-
--- Create persistent tables from file scans
+-- Build tables from file scans
 CREATE TABLE events AS SELECT * FROM read_parquet('/data/events/**/*.parquet');
 ```
 
-### 4. COPY Protocol
+### Connect from any language
 
-Use COPY for bulk data import/export:
+DuckD speaks standard PostgreSQL — use your existing driver:
 
-```bash
-# Export query results to a local file via psql
-psql -h localhost -p 5432 -U any -d any \
-  -c "\COPY (SELECT * FROM sales WHERE year=2024) TO '/tmp/sales_2024.csv' WITH (FORMAT csv, HEADER)"
+<details>
+<summary><b>psql</b></summary>
 
-# Import CSV data from stdin
-psql -h localhost -p 5432 -U any -d any \
-  -c "\COPY products FROM '/tmp/products.csv' WITH (FORMAT csv, HEADER)"
-```
-
-```python
-# Python: bulk import with psycopg2 copy_expert
-import psycopg2
-
-conn = psycopg2.connect(host="localhost", port=5432, user="any", dbname="any")
-cur = conn.cursor()
-
-# Export
-with open('/tmp/output.csv', 'w') as f:
-    cur.copy_expert("COPY (SELECT * FROM sales) TO STDOUT WITH CSV HEADER", f)
-
-# Import
-with open('/tmp/data.csv', 'r') as f:
-    cur.copy_expert("COPY target_table FROM STDIN WITH CSV HEADER", f)
-
-conn.commit()
-```
-
-### 5. Connecting from Different Languages
-
-**psql (CLI):**
 ```bash
 psql -h localhost -p 5432 -U any -d any
 ```
+</details>
 
-**Python (psycopg2):**
+<details>
+<summary><b>Python (psycopg2)</b></summary>
+
 ```python
 import psycopg2
 
 conn = psycopg2.connect(host="localhost", port=5432, user="any", database="any")
 cur = conn.cursor()
 cur.execute("SELECT * FROM read_parquet('/data/sales.parquet') LIMIT 10")
-rows = cur.fetchall()
-for row in rows:
+for row in cur.fetchall():
     print(row)
 conn.close()
 ```
+</details>
 
-**Python (SQLAlchemy):**
+<details>
+<summary><b>Python (SQLAlchemy)</b></summary>
+
 ```python
 from sqlalchemy import create_engine, text
 
 engine = create_engine("postgresql://any:any@localhost:5432/any")
 with engine.connect() as conn:
-    result = conn.execute(text("SELECT COUNT(*) FROM sales"))
-    print(result.scalar())
+    result = conn.execute(text("""
+        SELECT product, SUM(amount) as total
+        FROM read_parquet('/data/sales.parquet')
+        GROUP BY product ORDER BY total DESC
+    """))
+    for row in result:
+        print(row)
 ```
+</details>
 
-**Node.js (pg):**
+<details>
+<summary><b>Node.js</b></summary>
+
 ```javascript
 const { Client } = require('pg');
 
 const client = new Client({
-  host: 'localhost',
-  port: 5432,
-  user: 'any',
-  database: 'any',
+  host: 'localhost', port: 5432, user: 'any', database: 'any'
 });
-
 await client.connect();
-const res = await client.query('SELECT * FROM read_parquet($1)', ['/data/sales.parquet']);
+
+const res = await client.query(
+  'SELECT * FROM read_parquet($1) LIMIT 10', ['/data/sales.parquet']
+);
 console.log(res.rows);
 await client.end();
 ```
+</details>
 
-**Java (JDBC):**
+<details>
+<summary><b>Java (JDBC)</b></summary>
+
 ```java
-import java.sql.*;
-
 Connection conn = DriverManager.getConnection(
     "jdbc:postgresql://localhost:5432/any", "any", "any");
 
@@ -232,135 +188,145 @@ ResultSet rs = stmt.executeQuery(
 while (rs.next()) {
     System.out.printf("%s: %.2f%n", rs.getString(1), rs.getDouble(2));
 }
-
 conn.close();
 ```
+</details>
 
-**Go (pgx):**
+<details>
+<summary><b>Go (pgx)</b></summary>
+
 ```go
-import "github.com/jackc/pgx/v5"
-
 conn, _ := pgx.Connect(context.Background(),
     "postgres://any:any@localhost:5432/any")
+defer conn.Close(context.Background())
 
 rows, _ := conn.Query(context.Background(),
     "SELECT * FROM read_parquet('/data/sales.parquet') LIMIT 10")
 ```
+</details>
 
-**DBeaver / TablePlus / DataGrip:** Create a PostgreSQL connection to `localhost:5432`, any username/password.
+**GUI tools:** DBeaver, TablePlus, DataGrip, Metabase, Grafana — just create a PostgreSQL connection to `localhost:5432`.
 
-### 6. Arrow Flight SQL
-
-Enable high-throughput columnar data access via gRPC:
+### Bulk data with COPY
 
 ```bash
-# Start server with Flight SQL enabled
-./duckd-server --port 5432 --flight-port 8815 --http-port 8080
+# Export query results
+psql -h localhost -p 5432 -U any -d any \
+  -c "\COPY (SELECT * FROM sales WHERE year=2024) TO '/tmp/sales.csv' WITH (FORMAT csv, HEADER)"
+
+# Import from CSV
+psql -h localhost -p 5432 -U any -d any \
+  -c "\COPY products FROM '/tmp/products.csv' WITH (FORMAT csv, HEADER)"
 ```
 
-**Python (pyarrow):**
 ```python
-from pyarrow.flight import FlightClient, FlightCallOptions
-import pyarrow.flight
+# Python: streaming COPY with psycopg2
+conn = psycopg2.connect(host="localhost", port=5432, user="any", dbname="any")
+cur = conn.cursor()
 
-client = FlightClient("grpc://localhost:8815")
+with open('output.csv', 'w') as f:
+    cur.copy_expert("COPY (SELECT * FROM sales) TO STDOUT WITH CSV HEADER", f)
 
-# Execute a query and get results as Arrow Table
-info = client.get_flight_info(
-    pyarrow.flight.FlightDescriptor.for_command(
-        b'SELECT * FROM read_parquet("/data/sales.parquet")'
-    )
-)
-reader = client.do_get(info.endpoints[0].ticket)
-table = reader.read_all()
-print(table.to_pandas())
+with open('data.csv', 'r') as f:
+    cur.copy_expert("COPY target_table FROM STDIN WITH CSV HEADER", f)
+
+conn.commit()
 ```
 
-### 7. DuckDB Client Extension (Federated Queries)
-
-The `duckd-client` extension (built with `WITH_FLIGHT_SQL=ON`) lets any DuckDB instance ATTACH a remote DuckD server. This enables federated queries across local and remote data.
-
-**ATTACH remote database:**
-```sql
-LOAD duckd_client;
-
--- Attach a remote DuckD instance
-ATTACH 'grpc://remote-server:8815' AS warehouse (TYPE duckd);
-
--- Query remote tables as if they were local
-SELECT * FROM warehouse.main.sales WHERE year = 2024;
-
--- Join local and remote data
-SELECT l.*, r.customer_name
-FROM local_orders l
-JOIN warehouse.main.customers r ON l.customer_id = r.id;
-```
-
-**Execute DDL/DML on remote server:**
-```sql
--- duckd_exec: execute statements, returns affected row count
-SELECT duckd_exec('grpc://remote-server:8815', 'CREATE TABLE logs (ts TIMESTAMP, msg VARCHAR)');
-SELECT duckd_exec('grpc://remote-server:8815', 'INSERT INTO logs VALUES (now(), ''hello'')');
-SELECT duckd_exec('grpc://remote-server:8815', 'DELETE FROM logs WHERE ts < ''2024-01-01''');
-```
-
-**Ad-hoc remote queries:**
-```sql
--- duckd_query: execute a query and return results as a table
-SELECT * FROM duckd_query('grpc://remote-server:8815',
-    'SELECT dept, COUNT(*) as cnt, AVG(salary) as avg_sal
-     FROM employees GROUP BY dept');
-
--- Aggregate remote results locally
-SELECT dept, SUM(cnt) FROM duckd_query('grpc://remote-server:8815',
-    'SELECT * FROM employees') GROUP BY dept;
-```
-
-### 8. Prepared Statements and Transactions
+### Transactions and prepared statements
 
 DuckD supports the full PostgreSQL extended query protocol:
 
 ```python
-import psycopg2
-
 conn = psycopg2.connect(host="localhost", port=5432, user="any", dbname="any")
 conn.autocommit = False
 cur = conn.cursor()
 
 try:
-    # Prepared statements with parameters
-    cur.execute("CREATE TABLE IF NOT EXISTS accounts (id INT, balance DECIMAL(10,2))")
     cur.execute("INSERT INTO accounts VALUES (%s, %s)", (1, 1000.00))
-    cur.execute("INSERT INTO accounts VALUES (%s, %s)", (2, 2000.00))
-
-    # Transaction: transfer funds
     cur.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (100, 1))
     cur.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (100, 2))
-
     conn.commit()
 except Exception:
     conn.rollback()
     raise
 ```
 
-### 9. Monitoring
+### Arrow Flight SQL — high-throughput columnar access
+
+Start the server with Flight SQL enabled for near-zero-copy data transfer over gRPC:
 
 ```bash
-# Health check (for load balancers)
+./duckd-server --port 5432 --flight-port 8815 --http-port 8080
+```
+
+```python
+import pyarrow.flight
+
+client = pyarrow.flight.FlightClient("grpc://localhost:8815")
+
+info = client.get_flight_info(
+    pyarrow.flight.FlightDescriptor.for_command(
+        b'SELECT * FROM read_parquet("/data/sales.parquet")'
+    )
+)
+
+reader = client.do_get(info.endpoints[0].ticket)
+table = reader.read_all()            # Zero-copy Arrow Table
+df = table.to_pandas()               # Convert to Pandas
+print(df.describe())
+```
+
+### Federated queries with the DuckDB client extension
+
+The `duckd-client` extension (built with `-DWITH_FLIGHT_SQL=ON`) lets any DuckDB instance transparently ATTACH a remote DuckD server. Query remote tables as if they were local and join across multiple data sources:
+
+```sql
+LOAD duckd_client;
+
+-- Attach a remote DuckD server
+ATTACH 'grpc://analytics-server:8815' AS warehouse (TYPE duckd);
+
+-- Query remote tables transparently
+SELECT * FROM warehouse.main.sales WHERE region = 'APAC' AND year = 2024;
+
+-- Join local and remote data — the optimizer pushes filters to the remote side
+SELECT o.order_id, o.total, c.name, c.tier
+FROM local_orders o
+JOIN warehouse.main.customers c ON o.customer_id = c.id
+WHERE c.tier = 'enterprise';
+```
+
+Execute DDL/DML on remote servers:
+
+```sql
+-- duckd_exec: run statements, returns affected row count
+SELECT duckd_exec('grpc://server:8815', 'CREATE TABLE logs (ts TIMESTAMP, msg VARCHAR)');
+SELECT duckd_exec('grpc://server:8815', 'INSERT INTO logs VALUES (now(), ''deployed v2.1'')');
+
+-- duckd_query: run a query, returns results as a table function
+SELECT * FROM duckd_query('grpc://server:8815',
+    'SELECT dept, COUNT(*) as cnt, AVG(salary) as avg_sal
+     FROM employees GROUP BY dept ORDER BY avg_sal DESC');
+```
+
+### Monitoring
+
+```bash
+# Health check — use in load balancer probes
 curl http://localhost:8080/health
 # {"status":"healthy","connections":3}
 
-# Prometheus metrics
+# Prometheus-compatible metrics
 curl http://localhost:8080/metrics
 # duckd_connections_active 3
 # duckd_connections_total 42
-# duckd_bytes_received_total 1024000
-# duckd_bytes_sent_total 2048000
 # duckd_sessions_active 3
-# duckd_sessions_total 42
+# duckd_bytes_sent_total 2048000
+# ...
 ```
 
-Integrate with Prometheus by adding to `prometheus.yml`:
+Add to `prometheus.yml`:
 
 ```yaml
 scrape_configs:
@@ -371,49 +337,32 @@ scrape_configs:
 
 ## Configuration
 
-### Command Line
+### Command line
 
 ```bash
 ./duckd-server \
   --host 0.0.0.0 \
   --port 5432 \
-  --database /data/mydb.duckdb \
+  --database /data/warehouse.duckdb \
   --executor-threads 8 \
-  --max-connections 100 \
-  --query-timeout 300000 \
+  --max-connections 200 \
+  --query-timeout 600000 \
   --http-port 8080 \
-  --flight-port 8815
+  --flight-port 8815 \
+  --log-file /var/log/duckd/duckd.log \
+  --log-level info
 ```
 
-### Config File
+### Config file
 
 ```bash
-./duckd-server --config /etc/duckd/duckd.conf
+./duckd-server --config /etc/duckd/config.yaml
 ```
 
-**INI format** (`duckd.conf`):
+DuckD supports both INI and YAML formats (auto-detected by file extension). See [`etc/duckd.conf.example`](etc/duckd.conf.example) and [`etc/config.yaml.example`](etc/config.yaml.example).
 
-```ini
-host = 0.0.0.0
-port = 5432
-database = /var/lib/duckd/data.duckdb
-
-http_port = 8080
-io_threads = 4
-executor_threads = 8
-max_connections = 100
-query_timeout_ms = 300000
-session_timeout_minutes = 30
-
-log_file = /var/log/duckd/duckd.log
-log_level = info
-
-daemon = true
-pid_file = /var/run/duckd/duckd.pid
-user = duckd
-```
-
-**YAML format** (`config.yaml`):
+<details>
+<summary><b>YAML example</b></summary>
 
 ```yaml
 server:
@@ -430,7 +379,7 @@ logging:
   file: "/var/log/duckd/duckd.log"
 
 process:
-  daemon: false
+  daemon: true
   pid_file: "/var/run/duckd/duckd.pid"
   user: duckd
 
@@ -450,40 +399,61 @@ pool:
   max: 50
   idle_timeout_seconds: 300
   acquire_timeout_ms: 5000
-  validate_on_acquire: true
 ```
+</details>
 
-Format is auto-detected by file extension (`.yaml`/`.yml` = YAML, otherwise INI).
+<details>
+<summary><b>INI example</b></summary>
 
-### All Options
+```ini
+host = 0.0.0.0
+port = 5432
+database = /var/lib/duckd/data.duckdb
+
+http_port = 8080
+io_threads = 4
+executor_threads = 8
+max_connections = 100
+query_timeout_ms = 300000
+
+log_file = /var/log/duckd/duckd.log
+log_level = info
+
+daemon = true
+pid_file = /var/run/duckd/duckd.pid
+user = duckd
+```
+</details>
+
+### All options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `5432` | PostgreSQL protocol port |
-| `--database` | `:memory:` | Database file path |
-| `--io-threads` | auto | IO thread count (CPU cores / 2) |
-| `--executor-threads` | auto | Query executor thread count (CPU cores) |
+| `--database` | `:memory:` | DuckDB database file (`:memory:` for in-memory) |
+| `--io-threads` | auto | I/O thread count (default: CPU cores / 2) |
+| `--executor-threads` | auto | Query worker threads (default: CPU cores) |
 | `--max-connections` | `100` | Maximum concurrent connections |
-| `--query-timeout` | `300000` | Query timeout in milliseconds |
-| `--http-port` | disabled | HTTP port for health/metrics |
-| `--flight-port` | disabled | Arrow Flight SQL port (gRPC) |
-| `--max-memory` | unlimited | Max memory in bytes (Linux only) |
+| `--query-timeout` | `300000` | Query timeout in milliseconds (5 min) |
+| `--http-port` | disabled | HTTP port for `/health` and `/metrics` |
+| `--flight-port` | disabled | Arrow Flight SQL gRPC port |
+| `--max-memory` | unlimited | Memory limit in bytes (Linux only) |
 | `--max-open-files` | system | File descriptor limit |
-| `--daemon` | `false` | Run as background daemon |
+| `--daemon` | `false` | Daemonize the process |
 | `--pid-file` | — | PID file path |
-| `--log-file` | stderr | Log file path |
-| `--log-level` | `info` | `debug`, `info`, `warn`, `error` |
-| `--user` | — | Drop privileges to this user |
-| `--config` | — | Config file path |
-| `--version` | — | Show version info |
+| `--log-file` | stderr | Log output file |
+| `--log-level` | `info` | `debug` / `info` / `warn` / `error` |
+| `--user` | — | Drop privileges to this user after start |
+| `--config` | — | Path to config file (INI or YAML) |
+| `--version` | — | Print version and exit |
 
-## Signals
+### Signals
 
-| Signal | Action |
-|--------|--------|
-| `SIGTERM`, `SIGINT` | Graceful shutdown |
-| `SIGHUP` | Reload config (log level changes take effect immediately) |
+| Signal | Behavior |
+|--------|----------|
+| `SIGTERM` / `SIGINT` | Graceful shutdown — drains active connections |
+| `SIGHUP` | Hot-reload config (log level takes effect immediately) |
 
 ## Production Deployment
 
@@ -491,7 +461,7 @@ Format is auto-detected by file extension (`.yaml`/`.yml` = YAML, otherwise INI)
 
 ```ini
 [Unit]
-Description=DuckD Server
+Description=DuckD — DuckDB network server
 After=network.target
 
 [Service]
@@ -500,13 +470,14 @@ User=duckd
 ExecStart=/usr/local/bin/duckd-server --config /etc/duckd/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
+RestartSec=5
 LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Docker (example)
+### Docker
 
 ```dockerfile
 FROM ubuntu:24.04
@@ -517,37 +488,78 @@ CMD ["--database", "/data/warehouse.duckdb", "--http-port", "8080"]
 ```
 
 ```bash
-docker run -d -p 5432:5432 -p 8080:8080 \
-  -v /data:/data \
+docker run -d --name duckd \
+  -p 5432:5432 -p 8080:8080 \
+  -v ./data:/data \
   duckd --database /data/warehouse.duckdb --http-port 8080
 ```
 
 ## Architecture
 
 ```
-Client (psql / JDBC / psycopg2 / Arrow Flight)
-    │
-    │  PostgreSQL wire protocol    Arrow Flight SQL (gRPC)
-    ▼                              ▼
-TcpServer ── PgHandler        FlightSqlServer
-                │                   │
-                └───────┬───────────┘
-                        ▼
-                  ExecutorPool (lock-free queue, N worker threads)
-                        │
-                        ▼
-                  SessionManager ──► Session (1 DuckDB connection per session)
-                        │
-                        ▼
-                      DuckDB
+                    PostgreSQL clients                Arrow Flight clients
+                (psql, JDBC, psycopg2, BI tools)       (pyarrow, ADBC)
+                          │                                  │
+                          │ TCP :5432                         │ gRPC :8815
+                          ▼                                  ▼
+                    ┌───────────┐                     ┌──────────────┐
+                    │ TcpServer │                     │ FlightSQL    │
+                    │ (ASIO)    │                     │ Server       │
+                    └─────┬─────┘                     └──────┬───────┘
+                          │ PgHandler                        │
+                          │ (protocol state machine)         │
+                          └──────────────┬───────────────────┘
+                                         ▼
+                              ┌─────────────────────┐
+                              │   ExecutorPool      │
+                              │ (lock-free queue,   │
+                              │  N worker threads)  │
+                              └──────────┬──────────┘
+                                         ▼
+                              ┌─────────────────────┐
+                              │  SessionManager     │
+                              │  Session per conn   │──► DuckDB
+                              │  (sticky sessions)  │
+                              └─────────────────────┘
 ```
 
-- **Sticky sessions:** each connection gets its own DuckDB connection, held for the session lifetime. Transactions and prepared statements are pinned to the session.
-- **Async I/O:** network I/O is non-blocking via ASIO; queries run on a separate executor thread pool.
-- **Lock-free queue:** tasks are submitted to the executor via a moodycamel concurrent queue.
-- **Query cancellation:** propagates to DuckDB's interrupt mechanism.
-- **Crash safety:** SIGSEGV/SIGABRT handlers print stack traces before exit.
+**Key design decisions:**
+
+- **Sticky sessions.** Each network connection owns a dedicated DuckDB connection for its lifetime. Transactions, prepared statements, and temp tables are naturally scoped — no cross-connection leakage.
+- **Async I/O, sync execution.** Network I/O is non-blocking (ASIO). Queries are submitted to a fixed-size executor pool via a lock-free concurrent queue (moodycamel), keeping I/O threads responsive under heavy query load.
+- **Dual protocol.** The PostgreSQL protocol provides universal compatibility; Arrow Flight SQL adds a high-throughput binary path for analytics workloads that need columnar data at wire speed.
+- **Zero external dependencies at runtime.** Single static binary. No JVM, no Python, no cluster coordinator.
+
+### Source layout
+
+```
+src/
+├── network/          # ASIO TCP server, per-connection I/O
+├── protocol/
+│   ├── pg/           # PostgreSQL wire protocol v3 (handler, reader, writer)
+│   └── flight/       # Arrow Flight SQL server (opt-in)
+├── session/          # Session lifecycle, SessionManager
+├── executor/         # ExecutorPool — lock-free task queue + worker threads
+├── http/             # /health and /metrics HTTP endpoints
+├── logging/          # spdlog logger with DuckDB storage backend
+├── config/           # ServerConfig, YAML/INI parser
+├── client/
+│   ├── remote-client/  # DuckDB extension (PG protocol)
+│   └── duckd-client/   # DuckDB extension (Flight SQL)
+├── programs/
+│   ├── server/       # Server entry point
+│   └── client/       # CLI client entry point
+└── tests/            # Unit + integration tests
+```
+
+## Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repo and create a feature branch
+2. Make sure all tests pass: `ctest --test-dir build --output-on-failure`
+3. Open a pull request with a clear description
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+[Apache License 2.0](LICENSE)
