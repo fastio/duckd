@@ -566,6 +566,19 @@ static string ValueToSQLLiteral(const Value &val) {
             return "'" + StringUtil::Replace(val.ToString(), "'", "''") + "'";
         case LogicalTypeId::BOOLEAN:
             return val.GetValue<bool>() ? "true" : "false";
+        case LogicalTypeId::DATE:
+        case LogicalTypeId::TIME:
+        case LogicalTypeId::TIME_TZ:
+        case LogicalTypeId::TIMESTAMP:
+        case LogicalTypeId::TIMESTAMP_TZ:
+        case LogicalTypeId::TIMESTAMP_SEC:
+        case LogicalTypeId::TIMESTAMP_MS:
+        case LogicalTypeId::TIMESTAMP_NS:
+            return "'" + val.ToString() + "'";
+        case LogicalTypeId::INTERVAL:
+            return "INTERVAL '" + val.ToString() + "'";
+        case LogicalTypeId::BLOB:
+            return "'" + val.ToString() + "'";
         default:
             return val.ToString();
     }
@@ -1497,7 +1510,7 @@ void DuckdCatalog::DropSchema(ClientContext &context, DropInfo &info) {
     if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
         sql += "IF EXISTS ";
     }
-    sql       += info.name;
+    sql       += QuoteIdentifier(info.name);
     auto result = client_->ExecuteUpdate(sql);
     if (!result.ok()) {
         throw IOException("duckd: DROP SCHEMA failed: " + result.status().ToString());
