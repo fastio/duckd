@@ -7,8 +7,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "protocol/pg/pg_types.hpp"
+#include "duckdb.hpp"
 #include <cassert>
 #include <iostream>
+#include <cstring>
 
 using namespace duckdb_server::pg;
 
@@ -72,8 +74,8 @@ void TestDuckDBTypeToOid() {
     // Unsigned integer types
     assert(DuckDBTypeToOid(duckdb::LogicalTypeId::UTINYINT) == TypeOid::INT2);
     assert(DuckDBTypeToOid(duckdb::LogicalTypeId::USMALLINT) == TypeOid::INT2);
-    assert(DuckDBTypeToOid(duckdb::LogicalTypeId::UINTEGER) == TypeOid::INT4);
-    assert(DuckDBTypeToOid(duckdb::LogicalTypeId::UBIGINT) == TypeOid::INT8);
+    assert(DuckDBTypeToOid(duckdb::LogicalTypeId::UINTEGER) == TypeOid::NUMERIC);
+    assert(DuckDBTypeToOid(duckdb::LogicalTypeId::UBIGINT) == TypeOid::NUMERIC);
 
     // Huge integers
     assert(DuckDBTypeToOid(duckdb::LogicalTypeId::HUGEINT) == TypeOid::NUMERIC);
@@ -190,6 +192,101 @@ void TestFormatValue() {
 }
 
 //===----------------------------------------------------------------------===//
+// FormatCellDirect Tests (HUGEINT, UHUGEINT, UUID, DECIMAL)
+//===----------------------------------------------------------------------===//
+
+// Helper: create a single-row DataChunk, format it via FormatCellDirect, return the string.
+static std::string FormatSingleCell(duckdb::DuckDB& db, const duckdb::LogicalType& type, const std::string& literal) {
+    duckdb::Connection conn(*db.instance);
+    auto result = conn.Query("SELECT " + literal + "::" + type.ToString());
+    assert(!result->HasError());
+    auto chunk = result->Fetch();
+    assert(chunk && chunk->size() == 1);
+
+    duckdb::UnifiedVectorFormat col_data;
+    chunk->data[0].ToUnifiedFormat(chunk->size(), col_data);
+
+    std::string out;
+    bool ok = FormatCellDirect(col_data, 0, type, out);
+    assert(ok);
+    return out;
+}
+
+void TestFormatCellDirectHugeint() {
+    std::cout << "  Testing FormatCellDirect HUGEINT..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+
+    assert(FormatSingleCell(db, duckdb::LogicalType::HUGEINT, "0") == "0");
+    assert(FormatSingleCell(db, duckdb::LogicalType::HUGEINT, "42") == "42");
+    assert(FormatSingleCell(db, duckdb::LogicalType::HUGEINT, "-1") == "-1");
+    assert(FormatSingleCell(db, duckdb::LogicalType::HUGEINT, "170141183460469231731687303715884105727") ==
+           "170141183460469231731687303715884105727");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellDirectUhugeint() {
+    std::cout << "  Testing FormatCellDirect UHUGEINT..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+
+    assert(FormatSingleCell(db, duckdb::LogicalType::UHUGEINT, "0") == "0");
+    assert(FormatSingleCell(db, duckdb::LogicalType::UHUGEINT, "12345678901234567890") ==
+           "12345678901234567890");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellDirectUUID() {
+    std::cout << "  Testing FormatCellDirect UUID..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+
+    auto result = FormatSingleCell(db, duckdb::LogicalType::UUID, "'550e8400-e29b-41d4-a716-446655440000'");
+    assert(result == "550e8400-e29b-41d4-a716-446655440000");
+
+    // All zeros
+    result = FormatSingleCell(db, duckdb::LogicalType::UUID, "'00000000-0000-0000-0000-000000000000'");
+    assert(result == "00000000-0000-0000-0000-000000000000");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellDirectDecimal() {
+    std::cout << "  Testing FormatCellDirect DECIMAL..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+
+    // DECIMAL(5,2) — stored as INT16
+    auto dec_5_2 = duckdb::LogicalType::DECIMAL(5, 2);
+    assert(FormatSingleCell(db, dec_5_2, "123.45") == "123.45");
+    assert(FormatSingleCell(db, dec_5_2, "0.01") == "0.01");
+    assert(FormatSingleCell(db, dec_5_2, "-99.99") == "-99.99");
+    assert(FormatSingleCell(db, dec_5_2, "0.00") == "0.00");
+
+    // DECIMAL(10,4) — stored as INT32
+    auto dec_10_4 = duckdb::LogicalType::DECIMAL(10, 4);
+    assert(FormatSingleCell(db, dec_10_4, "123456.7890") == "123456.7890");
+    assert(FormatSingleCell(db, dec_10_4, "0.0001") == "0.0001");
+
+    // DECIMAL(18,6) — stored as INT64
+    auto dec_18_6 = duckdb::LogicalType::DECIMAL(18, 6);
+    assert(FormatSingleCell(db, dec_18_6, "123456789012.345678") == "123456789012.345678");
+
+    // DECIMAL(30,10) — stored as INT128
+    auto dec_30_10 = duckdb::LogicalType::DECIMAL(30, 10);
+    assert(FormatSingleCell(db, dec_30_10, "12345678901234567890.1234567890") ==
+           "12345678901234567890.1234567890");
+
+    // DECIMAL with scale=0 (no decimal point)
+    auto dec_5_0 = duckdb::LogicalType::DECIMAL(5, 0);
+    assert(FormatSingleCell(db, dec_5_0, "12345") == "12345");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -208,6 +305,12 @@ int main() {
 
     std::cout << "\n4. Value Formatting:" << std::endl;
     TestFormatValue();
+
+    std::cout << "\n5. FormatCellDirect (HUGEINT/UUID/DECIMAL):" << std::endl;
+    TestFormatCellDirectHugeint();
+    TestFormatCellDirectUhugeint();
+    TestFormatCellDirectUUID();
+    TestFormatCellDirectDecimal();
 
     std::cout << "\n=== All tests PASSED ===" << std::endl;
     return 0;

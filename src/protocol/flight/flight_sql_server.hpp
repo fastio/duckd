@@ -163,7 +163,7 @@ private:
         std::string query;
         std::shared_ptr<arrow::Schema> result_schema;
         std::shared_ptr<arrow::Schema> parameter_schema;
-        duckdb::vector<duckdb::Value> bound_parameters;
+        duckdb::vector<duckdb::vector<duckdb::Value>> bound_parameter_rows;
     };
 
     // Transient query storage (for GetFlightInfo → DoGet flow)

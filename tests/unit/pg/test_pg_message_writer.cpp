@@ -8,6 +8,7 @@
 
 #include "protocol/pg/pg_message_writer.hpp"
 #include "protocol/pg/pg_protocol.hpp"
+#include "duckdb.hpp"
 #include <cassert>
 #include <iostream>
 #include <cstring>
@@ -491,6 +492,260 @@ void TestMultipleMessages() {
 }
 
 //===----------------------------------------------------------------------===//
+// Binary Format Tests
+//===----------------------------------------------------------------------===//
+
+// Helper to extract int64 from buffer in network byte order
+int64_t ExtractInt64(const std::vector<uint8_t>& buf, size_t offset) {
+    int64_t value;
+    std::memcpy(&value, buf.data() + offset, 8);
+    return NetworkToHost64(value);
+}
+
+void TestFormatCellBinaryBool() {
+    std::cout << "  Testing FormatCellBinary BOOL..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection conn(*db.instance);
+
+    auto result = conn.Query("SELECT true, false");
+    assert(!result->HasError());
+    auto chunk = result->Fetch();
+    assert(chunk && chunk->size() == 1);
+
+    auto unified = chunk->ToUnifiedFormat();
+    std::vector<uint8_t> out;
+
+    // true → 0x01
+    assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::BOOLEAN, out));
+    assert(out.size() == 1);
+    assert(out[0] == 1);
+
+    // false → 0x00
+    assert(FormatCellBinary(unified[1], 0, duckdb::LogicalType::BOOLEAN, out));
+    assert(out.size() == 1);
+    assert(out[0] == 0);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellBinaryInt() {
+    std::cout << "  Testing FormatCellBinary INT types..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection conn(*db.instance);
+
+    // INT4 = 42
+    {
+        auto result = conn.Query("SELECT 42::INTEGER");
+        auto chunk = result->Fetch();
+        auto unified = chunk->ToUnifiedFormat();
+        std::vector<uint8_t> out;
+        assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::INTEGER, out));
+        assert(out.size() == 4);
+        int32_t val;
+        std::memcpy(&val, out.data(), 4);
+        assert(NetworkToHost32(val) == 42);
+    }
+
+    // INT8 = -123456789012345
+    {
+        auto result = conn.Query("SELECT -123456789012345::BIGINT");
+        auto chunk = result->Fetch();
+        auto unified = chunk->ToUnifiedFormat();
+        std::vector<uint8_t> out;
+        assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::BIGINT, out));
+        assert(out.size() == 8);
+        int64_t val;
+        std::memcpy(&val, out.data(), 8);
+        assert(NetworkToHost64(val) == -123456789012345LL);
+    }
+
+    // SMALLINT = -32000
+    {
+        auto result = conn.Query("SELECT (-32000)::SMALLINT");
+        auto chunk = result->Fetch();
+        auto unified = chunk->ToUnifiedFormat();
+        std::vector<uint8_t> out;
+        assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::SMALLINT, out));
+        assert(out.size() == 2);
+        int16_t val;
+        std::memcpy(&val, out.data(), 2);
+        assert(NetworkToHost16(val) == -32000);
+    }
+
+    // TINYINT = 100 → sent as INT2
+    {
+        auto result = conn.Query("SELECT 100::TINYINT");
+        auto chunk = result->Fetch();
+        auto unified = chunk->ToUnifiedFormat();
+        std::vector<uint8_t> out;
+        assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::TINYINT, out));
+        assert(out.size() == 2);
+        int16_t val;
+        std::memcpy(&val, out.data(), 2);
+        assert(NetworkToHost16(val) == 100);
+    }
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellBinaryFloat() {
+    std::cout << "  Testing FormatCellBinary FLOAT/DOUBLE..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection conn(*db.instance);
+
+    // FLOAT4 = 3.14
+    {
+        auto result = conn.Query("SELECT 3.14::FLOAT");
+        auto chunk = result->Fetch();
+        auto unified = chunk->ToUnifiedFormat();
+        std::vector<uint8_t> out;
+        assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::FLOAT, out));
+        assert(out.size() == 4);
+        // Decode: network→host for float bits
+        uint32_t bits;
+        std::memcpy(&bits, out.data(), 4);
+        bits = ntohl(bits);
+        float val;
+        std::memcpy(&val, &bits, 4);
+        assert(val > 3.13f && val < 3.15f);
+    }
+
+    // FLOAT8 = 2.718281828
+    {
+        auto result = conn.Query("SELECT 2.718281828::DOUBLE");
+        auto chunk = result->Fetch();
+        auto unified = chunk->ToUnifiedFormat();
+        std::vector<uint8_t> out;
+        assert(FormatCellBinary(unified[0], 0, duckdb::LogicalType::DOUBLE, out));
+        assert(out.size() == 8);
+        int64_t bits;
+        std::memcpy(&bits, out.data(), 8);
+        bits = NetworkToHost64(bits);
+        double val;
+        std::memcpy(&val, &bits, 8);
+        assert(val > 2.718 && val < 2.719);
+    }
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellBinaryNull() {
+    std::cout << "  Testing FormatCellBinary NULL..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection conn(*db.instance);
+
+    auto result = conn.Query("SELECT NULL::INTEGER");
+    auto chunk = result->Fetch();
+    auto unified = chunk->ToUnifiedFormat();
+    std::vector<uint8_t> out;
+    // FormatCellBinary returns false for NULL
+    assert(!FormatCellBinary(unified[0], 0, duckdb::LogicalType::INTEGER, out));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestFormatCellBinaryUnsupported() {
+    std::cout << "  Testing FormatCellBinary unsupported type..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection conn(*db.instance);
+
+    auto result = conn.Query("SELECT '2024-01-15'::DATE");
+    auto chunk = result->Fetch();
+    auto unified = chunk->ToUnifiedFormat();
+    std::vector<uint8_t> out;
+    // DATE is not supported for binary format — should return false
+    assert(!FormatCellBinary(unified[0], 0, duckdb::LogicalType::DATE, out));
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestWriteRowDescriptionWithFormats() {
+    std::cout << "  Testing WriteRowDescription with format codes..." << std::endl;
+
+    PgMessageWriter writer;
+    std::vector<std::string> names = {"id", "name"};
+    std::vector<duckdb::LogicalType> types = {
+        duckdb::LogicalType::INTEGER,
+        duckdb::LogicalType::VARCHAR
+    };
+    // id=binary, name=text
+    std::vector<int16_t> formats = {FormatCode::Binary, FormatCode::Text};
+    writer.WriteRowDescription(names, types, formats);
+
+    const auto& buf = writer.GetBuffer();
+    assert(buf[0] == 'T');
+
+    int16_t num_fields = ExtractInt16(buf, 5);
+    assert(num_fields == 2);
+
+    // Parse first field to find its format code
+    // Field layout: name(null-term) + table_oid(4) + col_attr(2) + type_oid(4) + type_size(2) + type_mod(4) + format(2)
+    size_t offset = 7;
+    // Skip "id\0"
+    offset += 3;
+    // table_oid(4) + col_attr(2) + type_oid(4) + type_size(2) + type_mod(4) = 16
+    offset += 16;
+    int16_t fmt1 = ExtractInt16(buf, offset);
+    assert(fmt1 == FormatCode::Binary);
+    offset += 2;
+
+    // Second field: "name\0"
+    offset += 5;
+    offset += 16;
+    int16_t fmt2 = ExtractInt16(buf, offset);
+    assert(fmt2 == FormatCode::Text);
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestWriteDataRowDirectBinary() {
+    std::cout << "  Testing WriteDataRowDirect with binary format..." << std::endl;
+
+    duckdb::DuckDB db(nullptr);
+    duckdb::Connection conn(*db.instance);
+
+    auto result = conn.Query("SELECT 42::INTEGER, 'hello'::VARCHAR");
+    auto chunk = result->Fetch();
+    auto unified = chunk->ToUnifiedFormat();
+
+    std::vector<duckdb::LogicalType> types = {
+        duckdb::LogicalType::INTEGER,
+        duckdb::LogicalType::VARCHAR
+    };
+
+    PgMessageWriter writer;
+    // All binary format
+    std::vector<int16_t> formats = {FormatCode::Binary, FormatCode::Binary};
+    writer.WriteDataRowDirect(unified, types, 0, 2, chunk.get(), formats);
+
+    const auto& buf = writer.GetBuffer();
+    assert(buf[0] == 'D');
+
+    int16_t num_cols = ExtractInt16(buf, 5);
+    assert(num_cols == 2);
+
+    // First column: INT4 binary = 4 bytes
+    int32_t col1_len = ExtractInt32(buf, 7);
+    assert(col1_len == 4);
+    int32_t col1_val;
+    std::memcpy(&col1_val, buf.data() + 11, 4);
+    assert(NetworkToHost32(col1_val) == 42);
+
+    // Second column: VARCHAR — binary not supported, falls back to text "hello"
+    int32_t col2_len = ExtractInt32(buf, 15);
+    assert(col2_len == 5);  // "hello"
+    std::string col2_val(reinterpret_cast<const char*>(buf.data() + 19), 5);
+    assert(col2_val == "hello");
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -528,6 +783,15 @@ int main() {
     std::cout << "\n6. Buffer Management:" << std::endl;
     TestClearBuffer();
     TestMultipleMessages();
+
+    std::cout << "\n7. Binary Format:" << std::endl;
+    TestFormatCellBinaryBool();
+    TestFormatCellBinaryInt();
+    TestFormatCellBinaryFloat();
+    TestFormatCellBinaryNull();
+    TestFormatCellBinaryUnsupported();
+    TestWriteRowDescriptionWithFormats();
+    TestWriteDataRowDirectBinary();
 
     std::cout << "\n=== All tests PASSED ===" << std::endl;
     return 0;

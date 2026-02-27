@@ -574,7 +574,8 @@ void PgHandler::HandleDescribe(const uint8_t* data, size_t len) {
         } else if (stmt_it->second.column_names.empty()) {
             writer.WriteNoData();
         } else {
-            writer.WriteRowDescription(stmt_it->second.column_names, stmt_it->second.column_types);
+            writer.WriteRowDescription(stmt_it->second.column_names, stmt_it->second.column_types,
+                                       it->second.result_formats);
         }
     }
 
@@ -607,6 +608,7 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
 
     // Capture what we need for the async lambda
     auto params = portal.parameters;
+    auto result_formats = portal.result_formats;
     int32_t max_rows = msg.max_rows;
     std::string query = stmt_it->second.query;
     auto statement = stmt_it->second.statement;
@@ -617,8 +619,8 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
     auto send_cb = send_callback;
     auto resume_cb = resume_callback;
 
-    executor_pool->Submit([this, params = std::move(params), max_rows, query,
-                            statement, sess, send_cb, resume_cb]() {
+    executor_pool->Submit([this, params = std::move(params), result_formats = std::move(result_formats),
+                            max_rows, query, statement, sess, send_cb, resume_cb]() {
         PgMessageWriter writer;
         sess->MarkQueryStart();
 
@@ -666,7 +668,7 @@ void PgHandler::HandleExecute(const uint8_t* data, size_t len) {
                         suspended = true;
                         break;
                     }
-                    writer.WriteDataRowDirect(unified, types, row, col_count, chunk.get());
+                    writer.WriteDataRowDirect(unified, types, row, col_count, chunk.get(), result_formats);
                     row_count++;
                 }
 
@@ -813,6 +815,22 @@ std::string PgHandler::GetCommandTag(const std::string& sql, uint64_t rows_affec
         return "SHOW";
     } else if (SqlStartsWithCI(s, len, "COPY")) {
         return "COPY " + std::to_string(rows_affected);
+    } else if (SqlStartsWithCI(s, len, "EXPLAIN")) {
+        return "EXPLAIN";
+    } else if (SqlStartsWithCI(s, len, "VACUUM")) {
+        return "VACUUM";
+    } else if (SqlStartsWithCI(s, len, "LOAD")) {
+        return "LOAD";
+    } else if (SqlStartsWithCI(s, len, "CALL")) {
+        return "CALL";
+    } else if (SqlStartsWithCI(s, len, "ATTACH")) {
+        return "ATTACH";
+    } else if (SqlStartsWithCI(s, len, "DETACH")) {
+        return "DETACH";
+    } else if (SqlStartsWithCI(s, len, "EXPORT")) {
+        return "EXPORT";
+    } else if (SqlStartsWithCI(s, len, "IMPORT")) {
+        return "IMPORT";
     }
 
     return "OK";

@@ -43,6 +43,7 @@
 #include "duckdb/parallel/event.hpp"
 
 #include <arrow/api.h>
+#include <arrow/array/array_nested.h>
 #include <arrow/type.h>
 
 #include <cstring>
@@ -97,6 +98,12 @@ LogicalType ArrowToDuckDBType(const arrow::DataType &type) {
                 children.push_back({f->name(), ArrowToDuckDBType(*f->type())});
             }
             return LogicalType::STRUCT(std::move(children));
+        }
+        case arrow::Type::MAP: {
+            auto &mt = static_cast<const arrow::MapType &>(type);
+            return LogicalType::MAP(
+                ArrowToDuckDBType(*mt.key_type()),
+                ArrowToDuckDBType(*mt.item_type()));
         }
         default:
             return LogicalType::VARCHAR; // safe fallback
@@ -425,8 +432,105 @@ void FillColumnFromArrow(Vector &dst, const arrow::Array &src,
         break;
     }
 
+    // LIST: columnar offset remapping + recursive child fill
+    case arrow::Type::LIST: {
+        auto &list_arr = static_cast<const arrow::ListArray &>(src);
+        const int32_t *offsets = list_arr.raw_value_offsets();
+        int32_t child_start = offsets[src_offset];
+        int32_t child_end   = offsets[src_offset + count];
+        idx_t total_children = static_cast<idx_t>(child_end - child_start);
+
+        auto *list_data = ListVector::GetData(dst);
+        idx_t cur = 0;
+        for (idx_t i = 0; i < count; i++) {
+            int32_t len = offsets[src_offset + i + 1] - offsets[src_offset + i];
+            list_data[i].offset = cur;
+            list_data[i].length = static_cast<uint64_t>(len);
+            cur += len;
+        }
+
+        ListVector::Reserve(dst, total_children);
+        ListVector::SetListSize(dst, total_children);
+        auto &child_vec = ListVector::GetEntry(dst);
+        FillColumnFromArrow(child_vec, *list_arr.values(), child_start, total_children);
+        break;
+    }
+
+    case arrow::Type::LARGE_LIST: {
+        auto &list_arr = static_cast<const arrow::LargeListArray &>(src);
+        const int64_t *offsets = list_arr.raw_value_offsets();
+        int64_t child_start = offsets[src_offset];
+        int64_t child_end   = offsets[src_offset + count];
+        idx_t total_children = static_cast<idx_t>(child_end - child_start);
+
+        auto *list_data = ListVector::GetData(dst);
+        idx_t cur = 0;
+        for (idx_t i = 0; i < count; i++) {
+            int64_t len = offsets[src_offset + i + 1] - offsets[src_offset + i];
+            list_data[i].offset = cur;
+            list_data[i].length = static_cast<uint64_t>(len);
+            cur += len;
+        }
+
+        ListVector::Reserve(dst, total_children);
+        ListVector::SetListSize(dst, total_children);
+        auto &child_vec = ListVector::GetEntry(dst);
+        FillColumnFromArrow(child_vec, *list_arr.values(), child_start, total_children);
+        break;
+    }
+
+    // STRUCT: per-field recursive fill + parent NULL propagation
+    case arrow::Type::STRUCT: {
+        auto &struct_arr = static_cast<const arrow::StructArray &>(src);
+        auto &child_entries = StructVector::GetEntries(dst);
+        auto &struct_validity = FlatVector::Validity(dst);
+
+        for (int field_idx = 0; field_idx < struct_arr.num_fields(); field_idx++) {
+            auto &child_entry = *child_entries[field_idx];
+            auto child_array = struct_arr.field(field_idx);
+
+            FillColumnFromArrow(child_entry, *child_array, src_offset, count);
+
+            // Propagate parent struct NULLs to child validity
+            if (!struct_validity.AllValid()) {
+                auto &child_validity = FlatVector::Validity(child_entry);
+                for (idx_t i = 0; i < count; i++) {
+                    if (!struct_validity.RowIsValid(i)) {
+                        child_validity.SetInvalid(i);
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    // MAP: Arrow MAP is LIST(STRUCT(key, value)); DuckDB MAP is the same.
+    // Reuse LIST handling — the child STRUCT is handled recursively.
+    case arrow::Type::MAP: {
+        auto &map_arr = static_cast<const arrow::MapArray &>(src);
+        const int32_t *offsets = map_arr.raw_value_offsets();
+        int32_t child_start = offsets[src_offset];
+        int32_t child_end   = offsets[src_offset + count];
+        idx_t total_children = static_cast<idx_t>(child_end - child_start);
+
+        auto *list_data = ListVector::GetData(dst);
+        idx_t cur = 0;
+        for (idx_t i = 0; i < count; i++) {
+            int32_t len = offsets[src_offset + i + 1] - offsets[src_offset + i];
+            list_data[i].offset = cur;
+            list_data[i].length = static_cast<uint64_t>(len);
+            cur += len;
+        }
+
+        ListVector::Reserve(dst, total_children);
+        ListVector::SetListSize(dst, total_children);
+        auto &child_vec = ListVector::GetEntry(dst);
+        FillColumnFromArrow(child_vec, *map_arr.values(), child_start, total_children);
+        break;
+    }
+
     default: {
-        // Fallback: row-by-row scalar boxing (covers nested LIST, STRUCT, …)
+        // Fallback: row-by-row scalar boxing (covers remaining types)
         for (idx_t i = 0; i < count; i++) {
             if (!src.IsNull(src_offset + i)) {
                 dst.SetValue(i, ArrowScalarToValue(src, src_offset + i));

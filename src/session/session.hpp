@@ -49,7 +49,7 @@ public:
 
     // Query timing
     void MarkQueryStart() { query_start_time = Clock::now(); query_running.store(true, std::memory_order_release); }
-    void MarkQueryEnd() { query_running = false; }
+    void MarkQueryEnd() { query_running.store(false, std::memory_order_release); cancel_requested.store(false, std::memory_order_relaxed); }
     bool IsQueryRunning() const { return query_running.load(std::memory_order_acquire); }
     TimePoint GetQueryStartTime() const { return query_start_time; }
 

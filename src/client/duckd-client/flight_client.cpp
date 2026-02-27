@@ -78,7 +78,7 @@ arrow::Result<std::shared_ptr<arrow::RecordBatch>> DuckdQueryStream::Next() {
         }
 
         ARROW_ASSIGN_OR_RAISE(current_stream_,
-            sql_client_->DoGet(call_options_, endpoints_[ep_idx_++].ticket));
+            client_owner_->GetSqlClient().DoGet(call_options_, endpoints_[ep_idx_++].ticket));
 
         // Populate schema from the first endpoint if not yet set
         if (!schema_) {
@@ -97,8 +97,7 @@ DuckdFlightClient::ExecuteQueryStream(const std::string& sql) {
 
     auto stream = std::unique_ptr<DuckdQueryStream>(new DuckdQueryStream());
     stream->client_owner_ = shared_from_this(); // keep *this alive for stream lifetime
-    stream->endpoints_   = info->endpoints();
-    stream->sql_client_  = client_.get();
+    stream->endpoints_    = info->endpoints();
     stream->call_options_ = call_options_;
 
     // Open the first endpoint immediately so the schema is available before
@@ -189,7 +188,6 @@ DuckdFlightClient::ExecuteQueryStream(const std::string& sql,
     auto stream = std::unique_ptr<DuckdQueryStream>(new DuckdQueryStream());
     stream->client_owner_ = shared_from_this(); // keep *this alive for stream lifetime
     stream->endpoints_    = info->endpoints();
-    stream->sql_client_   = client_.get();
     stream->call_options_ = call_options_;
 
     if (!stream->endpoints_.empty()) {

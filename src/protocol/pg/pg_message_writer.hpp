@@ -84,7 +84,8 @@ public:
     // Query Response Messages
     //===------------------------------------------------------------------===//
     void WriteRowDescription(const std::vector<std::string>& names,
-                             const std::vector<duckdb::LogicalType>& types) {
+                             const std::vector<duckdb::LogicalType>& types,
+                             const std::vector<int16_t>& format_codes = {}) {
         StartMessage(BackendMessage::RowDescription);
         WriteInt16(static_cast<int16_t>(names.size()));
 
@@ -96,7 +97,8 @@ public:
             WriteInt32(type_oid);            // Type OID
             WriteInt16(GetTypeSize(type_oid)); // Type size
             WriteInt32(-1);                  // Type modifier
-            WriteInt16(FormatCode::Text);    // Format code (text)
+            int16_t fmt = ResolveFormat(format_codes, i);
+            WriteInt16(fmt);                 // Format code
         }
         EndMessage();
     }
@@ -123,21 +125,43 @@ public:
                             const std::vector<duckdb::LogicalType>& types,
                             idx_t row_idx,
                             idx_t col_count,
-                            duckdb::DataChunk* chunk) {
+                            duckdb::DataChunk* chunk,
+                            const std::vector<int16_t>& format_codes = {}) {
         StartMessage(BackendMessage::DataRow);
         WriteInt16(static_cast<int16_t>(col_count));
 
         for (idx_t col = 0; col < col_count; col++) {
-            if (FormatCellDirect(col_data[col], row_idx, types[col], format_buffer)) {
-                WriteInt32(static_cast<int32_t>(format_buffer.size()));
-                WriteRawBytes(format_buffer.data(), format_buffer.size());
-            } else {
-                // FormatCellDirect returns false for NULL or unsupported types
-                auto idx = col_data[col].sel->get_index(row_idx);
-                if (!col_data[col].validity.RowIsValid(idx)) {
-                    WriteInt32(-1);  // NULL
+            // Check NULL first (shared by both text and binary paths)
+            auto idx = col_data[col].sel->get_index(row_idx);
+            if (!col_data[col].validity.RowIsValid(idx)) {
+                WriteInt32(-1);  // NULL
+                continue;
+            }
+
+            int16_t fmt = ResolveFormat(format_codes, col);
+            if (fmt == FormatCode::Binary) {
+                // Binary format path
+                if (FormatCellBinary(col_data[col], row_idx, types[col], binary_buffer)) {
+                    WriteInt32(static_cast<int32_t>(binary_buffer.size()));
+                    WriteBytes(binary_buffer.data(), binary_buffer.size());
                 } else {
-                    // Unsupported type: fall back to GetValue
+                    // Binary not supported for this type: fall back to text
+                    if (FormatCellDirect(col_data[col], row_idx, types[col], format_buffer)) {
+                        WriteInt32(static_cast<int32_t>(format_buffer.size()));
+                        WriteRawBytes(format_buffer.data(), format_buffer.size());
+                    } else {
+                        auto value = chunk->GetValue(col, row_idx);
+                        FormatValueInto(value, format_buffer);
+                        WriteInt32(static_cast<int32_t>(format_buffer.size()));
+                        WriteRawBytes(format_buffer.data(), format_buffer.size());
+                    }
+                }
+            } else {
+                // Text format path
+                if (FormatCellDirect(col_data[col], row_idx, types[col], format_buffer)) {
+                    WriteInt32(static_cast<int32_t>(format_buffer.size()));
+                    WriteRawBytes(format_buffer.data(), format_buffer.size());
+                } else {
                     auto value = chunk->GetValue(col, row_idx);
                     FormatValueInto(value, format_buffer);
                     WriteInt32(static_cast<int32_t>(format_buffer.size()));
@@ -279,10 +303,25 @@ private:
         WriteString(value);
     }
 
+    // Resolve format code for a column.
+    // PG Bind semantics: empty = all text, 1 element = all columns use that format,
+    // N elements = per-column format codes.
+    static int16_t ResolveFormat(const std::vector<int16_t>& format_codes, size_t col_idx) {
+        if (format_codes.empty()) {
+            return FormatCode::Text;
+        } else if (format_codes.size() == 1) {
+            return format_codes[0];
+        } else if (col_idx < format_codes.size()) {
+            return format_codes[col_idx];
+        }
+        return FormatCode::Text;
+    }
+
 private:
     std::vector<uint8_t> buffer;
     size_t message_start = 0;
-    std::string format_buffer;  // Reusable formatting buffer for WriteDataRow
+    std::string format_buffer;               // Reusable text formatting buffer
+    std::vector<uint8_t> binary_buffer;      // Reusable binary formatting buffer
 };
 
 } // namespace pg

@@ -206,8 +206,8 @@ void SessionManager::StartCleanupTimer() {
             }
 
             // Session cleanup less frequently (every 12 iterations = ~60 seconds)
-            if (++cleanup_counter >= 12) {
-                cleanup_counter = 0;
+            if (++cleanup_counter_ >= 12) {
+                cleanup_counter_ = 0;
                 CleanupExpiredSessions();
             }
         }

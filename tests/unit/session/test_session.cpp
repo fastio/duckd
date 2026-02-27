@@ -199,6 +199,80 @@ void TestInterruptQuery() {
     std::cout << "    PASSED" << std::endl;
 }
 
+void TestMarkQueryEndClearsCancelFlag() {
+    std::cout << "  Testing MarkQueryEnd clears cancel_requested..." << std::endl;
+
+    auto db = CreateDB();
+    Session session(1, db->instance);
+
+    // Simulate: query starts, gets interrupted, then ends
+    session.MarkQueryStart();
+    assert(session.IsQueryRunning());
+    assert(!session.IsCancelRequested());
+
+    session.InterruptQuery();
+    assert(session.IsCancelRequested());
+
+    // MarkQueryEnd should clear both query_running AND cancel_requested
+    session.MarkQueryEnd();
+    assert(!session.IsQueryRunning());
+    assert(!session.IsCancelRequested());
+
+    std::cout << "    PASSED" << std::endl;
+}
+
+void TestInterruptRunningQuery() {
+    std::cout << "  Testing interrupt a running DuckDB query..." << std::endl;
+
+    auto db = CreateDB();
+    Session session(1, db->instance);
+
+    // Force connection creation
+    auto& conn = session.GetConnection();
+    (void)conn;
+
+    // Run a long query in a background thread and interrupt it
+    std::atomic<bool> query_started{false};
+    std::atomic<bool> query_done{false};
+    bool had_error = false;
+
+    std::thread query_thread([&]() {
+        session.MarkQueryStart();
+        query_started = true;
+        // generate_series produces a large result set that takes time to iterate
+        auto result = session.GetConnection().Query(
+            "SELECT count(*) FROM generate_series(1, 100000000)");
+        had_error = result->HasError();
+        session.MarkQueryEnd();
+        query_done = true;
+    });
+
+    // Wait for query to start executing
+    while (!query_started) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // Give DuckDB a moment to begin execution
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Interrupt
+    session.InterruptQuery();
+
+    // Wait for query thread to finish (should finish quickly after interrupt)
+    query_thread.join();
+
+    assert(query_done);
+    // The query should have been interrupted (error) OR finished before interrupt arrived.
+    // Either way, cancel_requested should be cleared by MarkQueryEnd.
+    assert(!session.IsCancelRequested());
+    assert(!session.IsQueryRunning());
+
+    // Subsequent query should succeed (connection is still usable)
+    auto result = session.GetConnection().Query("SELECT 42 AS answer");
+    assert(!result->HasError());
+
+    std::cout << "    PASSED" << std::endl;
+}
+
 //===----------------------------------------------------------------------===//
 // Expiry Tests
 //===----------------------------------------------------------------------===//
@@ -278,6 +352,8 @@ int main() {
     std::cout << "\n4. Query Tracking:" << std::endl;
     TestQueryTracking();
     TestInterruptQuery();
+    TestMarkQueryEndClearsCancelFlag();
+    TestInterruptRunningQuery();
 
     std::cout << "\n5. Session Expiry:" << std::endl;
     TestSessionExpiry();

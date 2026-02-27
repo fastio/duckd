@@ -14,6 +14,7 @@
 #include <arrow/builder.h>
 #include <arrow/table.h>
 #include <arrow/ipc/writer.h>
+#include <arrow/io/memory.h>
 #include <arrow/buffer.h>
 
 namespace duckdb_server {
@@ -31,9 +32,9 @@ DuckDBFlightSqlServer::DuckDBFlightSqlServer(
     const std::string& host,
     uint16_t port)
     : session_manager_(session_manager)
-    , executor_pool_(executor_pool)
     , host_(host)
     , port_(port) {
+    (void)executor_pool;
 }
 
 DuckDBFlightSqlServer::~DuckDBFlightSqlServer() {
@@ -175,8 +176,113 @@ static arrow::Result<std::unique_ptr<flight::FlightInfo>> MakeCatalogFlightInfo(
 }
 
 //===----------------------------------------------------------------------===//
+// Transactions
+//===----------------------------------------------------------------------===//
+
+arrow::Result<flightsql::ActionBeginTransactionResult>
+DuckDBFlightSqlServer::BeginTransaction(
+    const flight::ServerCallContext& /*context*/,
+    const flightsql::ActionBeginTransactionRequest& /*request*/) {
+
+    auto handle = "duckd-txn-" + std::to_string(handle_counter_++);
+
+    // Open a dedicated connection and begin a DuckDB transaction
+    auto conn = std::make_shared<duckdb::Connection>(session_manager_->GetDatabase());
+    auto begin_result = conn->Query("BEGIN TRANSACTION");
+    if (begin_result->HasError()) {
+        return arrow::Status::ExecutionError(
+            "BEGIN TRANSACTION failed: " + begin_result->GetError());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(txn_mutex_);
+        open_transactions_[handle] = TransactionEntry{std::move(conn)};
+    }
+
+    flightsql::ActionBeginTransactionResult result;
+    result.transaction_id = handle;
+    return result;
+}
+
+arrow::Status DuckDBFlightSqlServer::EndTransaction(
+    const flight::ServerCallContext& /*context*/,
+    const flightsql::ActionEndTransactionRequest& request) {
+
+    std::shared_ptr<duckdb::Connection> conn;
+    {
+        std::lock_guard<std::mutex> lock(txn_mutex_);
+        auto it = open_transactions_.find(request.transaction_id);
+        if (it == open_transactions_.end()) {
+            return arrow::Status::KeyError(
+                "Unknown transaction ID: " + request.transaction_id);
+        }
+        conn = it->second.connection;
+        open_transactions_.erase(it);
+    }
+
+    std::string sql = (request.action == flightsql::ActionEndTransactionRequest::kCommit)
+                      ? "COMMIT"
+                      : "ROLLBACK";
+    auto result = conn->Query(sql);
+    if (result->HasError()) {
+        return arrow::Status::ExecutionError(sql + " failed: " + result->GetError());
+    }
+    return arrow::Status::OK();
+}
+
+// Helper: retrieve the connection for a transaction ID, or nullptr for auto-commit
+std::shared_ptr<duckdb::Connection>
+DuckDBFlightSqlServer::GetTransactionConnection(const std::string& transaction_id) {
+    if (transaction_id.empty()) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(txn_mutex_);
+    auto it = open_transactions_.find(transaction_id);
+    if (it != open_transactions_.end()) {
+        return it->second.connection;
+    }
+    return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
 // Statement execution
 //===----------------------------------------------------------------------===//
+
+arrow::Result<int64_t> DuckDBFlightSqlServer::DoPutCommandStatementUpdate(
+    const flight::ServerCallContext& /*context*/,
+    const flightsql::StatementUpdate& command) {
+
+    // Use transaction connection if one is active; otherwise create a fresh one
+    std::shared_ptr<duckdb::Connection> txn_conn =
+        GetTransactionConnection(command.transaction_id);
+
+    duckdb::Connection *conn_ptr = nullptr;
+    std::unique_ptr<duckdb::Connection> fresh_conn;
+    if (txn_conn) {
+        conn_ptr = txn_conn.get();
+    } else {
+        fresh_conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
+        conn_ptr   = fresh_conn.get();
+    }
+
+    auto *conn   = conn_ptr;
+    auto result = conn->Query(command.query);
+
+    if (result->HasError()) {
+        return arrow::Status::ExecutionError(result->GetError());
+    }
+
+    // Try to read an affected-row count if the result contains one
+    if (result->type == duckdb::QueryResultType::MATERIALIZED_RESULT) {
+        auto &mat = static_cast<duckdb::MaterializedQueryResult &>(*result);
+        if (mat.RowCount() > 0 && mat.ColumnCount() > 0) {
+            try {
+                return mat.GetValue(0, 0).GetValue<int64_t>();
+            } catch (...) {}
+        }
+    }
+    return 0;
+}
 
 arrow::Result<std::unique_ptr<flight::FlightInfo>>
 DuckDBFlightSqlServer::GetFlightInfoStatement(
@@ -186,26 +292,38 @@ DuckDBFlightSqlServer::GetFlightInfoStatement(
 
     const auto& query = command.query;
 
+    // Use transaction connection if active; otherwise a fresh connection
+    std::shared_ptr<duckdb::Connection> txn_conn =
+        GetTransactionConnection(command.transaction_id);
+    std::unique_ptr<duckdb::Connection> fresh_conn;
+    duckdb::Connection *conn_ptr = nullptr;
+    if (txn_conn) {
+        conn_ptr = txn_conn.get();
+    } else {
+        fresh_conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
+        conn_ptr   = fresh_conn.get();
+    }
+
     // Prepare the query to get schema without executing
-    auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
-    auto prepared = conn->Prepare(query);
+    auto prepared = conn_ptr->Prepare(query);
     if (prepared->HasError()) {
         return arrow::Status::ExecutionError(prepared->GetError());
     }
 
     auto& types = prepared->GetTypes();
     auto& names = prepared->GetNames();
-    auto props = GetClientProps(*conn);
+    auto props = GetClientProps(*conn_ptr);
     ARROW_ASSIGN_OR_RAISE(auto schema, MakeArrowSchema(types, names, props));
 
     auto handle = GenerateHandle();
 
-    // Store the query text so DoGetStatement can re-execute it
+    // Store the query text + transaction ID so DoGetStatement can execute it
     {
         std::lock_guard<std::mutex> lock(query_mutex_);
         TransientQuery tq;
-        tq.query = query;
-        tq.schema = schema;
+        tq.query          = query;
+        tq.schema         = schema;
+        tq.transaction_id = command.transaction_id;
         transient_queries_[handle] = std::move(tq);
     }
 
@@ -224,15 +342,17 @@ DuckDBFlightSqlServer::DoGetStatement(
     std::string query;
     std::shared_ptr<arrow::Schema> schema;
     bool is_prepared = false;
+    std::string transaction_id;
     {
         std::lock_guard<std::mutex> lock(query_mutex_);
         auto it = transient_queries_.find(handle);
         if (it == transient_queries_.end()) {
             return arrow::Status::KeyError("Statement handle not found: ", handle);
         }
-        query = it->second.query;
-        schema = it->second.schema;
-        is_prepared = it->second.is_prepared;
+        query          = it->second.query;
+        schema         = it->second.schema;
+        is_prepared    = it->second.is_prepared;
+        transaction_id = it->second.transaction_id;
         transient_queries_.erase(it);
     }
 
@@ -243,7 +363,22 @@ DuckDBFlightSqlServer::DoGetStatement(
         return DoGetPreparedStatement(context, ps_command);
     }
 
-    // Execute the query using a direct connection
+    // Use transaction connection if active; otherwise create a fresh connection
+    std::shared_ptr<duckdb::Connection> txn_conn =
+        GetTransactionConnection(transaction_id);
+
+    if (txn_conn) {
+        // Execute on the transaction connection (shared ownership keeps it alive)
+        auto result = txn_conn->Query(query);
+        if (result->HasError()) {
+            return arrow::Status::ExecutionError(result->GetError());
+        }
+        auto reader = std::make_shared<DuckDBRecordBatchReader>(
+            std::move(result), schema, txn_conn);
+        return std::make_unique<flight::RecordBatchStream>(reader);
+    }
+
+    // Execute the query using a fresh connection
     auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
     auto result = conn->Query(query);
 
@@ -384,8 +519,11 @@ DuckDBFlightSqlServer::DoGetPreparedStatement(
         }
         schema = it->second.result_schema;
         stmt = it->second.statement.get();
-        bound_params = std::move(it->second.bound_parameters);
-        it->second.bound_parameters.clear();
+        // For SELECT (DoGet), use the first parameter row only.
+        if (!it->second.bound_parameter_rows.empty()) {
+            bound_params = std::move(it->second.bound_parameter_rows[0]);
+        }
+        it->second.bound_parameter_rows.clear();
         props = GetClientProps(*it->second.connection);
     }
 
@@ -420,13 +558,18 @@ arrow::Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(
     // For now, we support simple scalar parameters
     const auto& handle = command.prepared_statement_handle;
 
-    std::lock_guard<std::mutex> lock(prepared_mutex_);
-    auto it = prepared_statements_.find(handle);
-    if (it == prepared_statements_.end()) {
-        return arrow::Status::KeyError("Prepared statement not found: ", handle);
+    // Step 1: Quick check that the handle exists (under lock)
+    {
+        std::lock_guard<std::mutex> lock(prepared_mutex_);
+        if (prepared_statements_.find(handle) == prepared_statements_.end()) {
+            return arrow::Status::KeyError("Prepared statement not found: ", handle);
+        }
     }
 
-    // Read parameter record batches from the client
+    // Step 2: Read parameter data from client WITHOUT holding the lock.
+    // reader->ToTable() performs network IO and can block if the client is slow;
+    // holding prepared_mutex_ during this call would block all other prepared
+    // statement operations (Create/Close/Execute/GetFlightInfo).
     auto table_result = reader->ToTable();
     if (!table_result.ok()) {
         return table_result.status();
@@ -437,18 +580,46 @@ arrow::Status DuckDBFlightSqlServer::DoPutPreparedStatementQuery(
         return arrow::Status::OK();
     }
 
-    // Convert Arrow columns at row 0 to DuckDB Values
-    duckdb::vector<duckdb::Value> params;
-    for (int col = 0; col < table->num_columns(); col++) {
-        auto chunk = table->column(col)->chunk(0);
-        if (chunk->IsNull(0)) {
-            params.push_back(duckdb::Value());
-        } else {
-            params.push_back(ArrowScalarToDuckDBValue(chunk, 0));
+    // Convert all parameter rows from Arrow to DuckDB Values (still lock-free).
+    // Each row in the table is a separate set of bound parameters.
+    int64_t num_rows = table->num_rows();
+    int num_cols = table->num_columns();
+    duckdb::vector<duckdb::vector<duckdb::Value>> param_rows;
+    param_rows.reserve(num_rows);
+
+    for (int64_t row = 0; row < num_rows; row++) {
+        duckdb::vector<duckdb::Value> params;
+        params.reserve(num_cols);
+        for (int col = 0; col < num_cols; col++) {
+            // Locate the chunk and local index for this row within the ChunkedArray
+            auto chunked = table->column(col);
+            int64_t offset = row;
+            std::shared_ptr<arrow::Array> chunk;
+            for (int c = 0; c < chunked->num_chunks(); c++) {
+                chunk = chunked->chunk(c);
+                if (offset < chunk->length()) break;
+                offset -= chunk->length();
+            }
+            if (chunk->IsNull(offset)) {
+                params.push_back(duckdb::Value());
+            } else {
+                params.push_back(ArrowScalarToDuckDBValue(chunk, offset));
+            }
         }
+        param_rows.push_back(std::move(params));
     }
 
-    it->second.bound_parameters = std::move(params);
+    // Step 3: Re-acquire lock and write bound parameters.
+    // Double-check: the statement may have been closed while we were reading.
+    {
+        std::lock_guard<std::mutex> lock(prepared_mutex_);
+        auto it = prepared_statements_.find(handle);
+        if (it == prepared_statements_.end()) {
+            return arrow::Status::KeyError("Prepared statement closed during parameter binding: ", handle);
+        }
+        it->second.bound_parameter_rows = std::move(param_rows);
+    }
+
     return arrow::Status::OK();
 }
 
@@ -677,11 +848,38 @@ DuckDBFlightSqlServer::DoGetTables(
     };
 
     if (command.include_schema) {
-        // Add empty binary column for table_schema (schema bytes)
+        // For each table, Prepare "SELECT * FROM schema.table" to get column
+        // types, then serialize the Arrow schema as IPC bytes.
         arrow::BinaryBuilder schema_bytes_builder;
+
+        auto cat_str = std::static_pointer_cast<arrow::StringArray>(cat_array);
+        auto sch_str = std::static_pointer_cast<arrow::StringArray>(sch_array);
+        auto name_str = std::static_pointer_cast<arrow::StringArray>(name_array);
+
+        auto conn = std::make_unique<duckdb::Connection>(session_manager_->GetDatabase());
+        auto props = GetClientProps(*conn);
+
         for (int64_t i = 0; i < cat_array->length(); i++) {
-            ARROW_RETURN_NOT_OK(schema_bytes_builder.AppendNull());
+            std::string probe_sql = "SELECT * FROM \"" +
+                sch_str->GetString(i) + "\".\"" + name_str->GetString(i) + "\" LIMIT 0";
+
+            auto prepared = conn->Prepare(probe_sql);
+            if (prepared->HasError()) {
+                // Cannot resolve schema — append NULL
+                ARROW_RETURN_NOT_OK(schema_bytes_builder.AppendNull());
+                continue;
+            }
+
+            auto& types = prepared->GetTypes();
+            auto& names = prepared->GetNames();
+            ARROW_ASSIGN_OR_RAISE(auto tbl_schema, MakeArrowSchema(types, names, props));
+
+            // Serialize schema to IPC format
+            ARROW_ASSIGN_OR_RAISE(auto serialized, arrow::ipc::SerializeSchema(*tbl_schema));
+            ARROW_RETURN_NOT_OK(schema_bytes_builder.Append(
+                serialized->data(), static_cast<int32_t>(serialized->size())));
         }
+
         std::shared_ptr<arrow::Array> schema_bytes_array;
         ARROW_RETURN_NOT_OK(schema_bytes_builder.Finish(&schema_bytes_array));
         columns.push_back(schema_bytes_array);

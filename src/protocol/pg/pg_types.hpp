@@ -14,11 +14,16 @@
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/common/types/string_type.hpp"
+#include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/uhugeint.hpp"
+#include "duckdb/common/types/uuid.hpp"
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <unordered_map>
 #include <string>
+#include <vector>
 
 namespace duckdb_server {
 namespace pg {
@@ -115,9 +120,8 @@ inline int32_t DuckDBTypeToOid(duckdb::LogicalTypeId type_id) {
         case duckdb::LogicalTypeId::USMALLINT:
             return TypeOid::INT2;
         case duckdb::LogicalTypeId::UINTEGER:
-            return TypeOid::INT4;
         case duckdb::LogicalTypeId::UBIGINT:
-            return TypeOid::INT8;
+            return TypeOid::NUMERIC;
         case duckdb::LogicalTypeId::HUGEINT:
         case duckdb::LogicalTypeId::UHUGEINT:
             return TypeOid::NUMERIC;
@@ -254,6 +258,35 @@ inline void FormatValueInto(const duckdb::Value& value, std::string& out) {
 //===----------------------------------------------------------------------===//
 // Direct Cell Formatting (bypasses duckdb::Value allocation)
 //===----------------------------------------------------------------------===//
+
+// Helper: format a scaled integer as a decimal string (e.g. 12345 with scale=2 → "123.45")
+// Works for any signed integer type that supports to_chars or Hugeint::ToString.
+inline void FormatDecimalString(const std::string& int_str, uint8_t scale, std::string& out) {
+    if (scale == 0) {
+        out = int_str;
+        return;
+    }
+    // Handle negative sign
+    bool negative = (!int_str.empty() && int_str[0] == '-');
+    const char* digits = int_str.data() + (negative ? 1 : 0);
+    size_t num_digits = int_str.size() - (negative ? 1 : 0);
+
+    out.clear();
+    if (negative) out += '-';
+
+    if (num_digits <= scale) {
+        // Value is in range (-1, 1): need "0." prefix and zero-padding
+        out += "0.";
+        for (size_t i = 0; i < scale - num_digits; i++) out += '0';
+        out.append(digits, num_digits);
+    } else {
+        // Integer part + decimal part
+        size_t int_part_len = num_digits - scale;
+        out.append(digits, int_part_len);
+        out += '.';
+        out.append(digits + int_part_len, scale);
+    }
+}
 
 // Helper: write zero-padded integer into buffer, returns pointer past end
 inline char* WritePadded(char* buf, int32_t val, int width) {
@@ -461,9 +494,174 @@ inline bool FormatCellDirect(const duckdb::UnifiedVectorFormat& col_data,
             out = duckdb::Interval::ToString(val);
             return true;
         }
+        case duckdb::LogicalTypeId::HUGEINT: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::hugeint_t>(col_data)[idx];
+            out = duckdb::Hugeint::ToString(val);
+            return true;
+        }
+        case duckdb::LogicalTypeId::UHUGEINT: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::uhugeint_t>(col_data)[idx];
+            out = duckdb::Uhugeint::ToString(val);
+            return true;
+        }
+        case duckdb::LogicalTypeId::UUID: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::hugeint_t>(col_data)[idx];
+            char buf[36];
+            duckdb::UUID::ToString(val, buf);
+            out.assign(buf, 36);
+            return true;
+        }
+        case duckdb::LogicalTypeId::DECIMAL: {
+            uint8_t width, scale;
+            type.GetDecimalProperties(width, scale);
+            switch (type.InternalType()) {
+                case duckdb::PhysicalType::INT16: {
+                    auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int16_t>(col_data)[idx];
+                    char buf[7];
+                    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+                    FormatDecimalString(std::string(buf, ptr), scale, out);
+                    return true;
+                }
+                case duckdb::PhysicalType::INT32: {
+                    auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int32_t>(col_data)[idx];
+                    char buf[12];
+                    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+                    FormatDecimalString(std::string(buf, ptr), scale, out);
+                    return true;
+                }
+                case duckdb::PhysicalType::INT64: {
+                    auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int64_t>(col_data)[idx];
+                    char buf[21];
+                    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), val);
+                    FormatDecimalString(std::string(buf, ptr), scale, out);
+                    return true;
+                }
+                case duckdb::PhysicalType::INT128: {
+                    auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<duckdb::hugeint_t>(col_data)[idx];
+                    FormatDecimalString(duckdb::Hugeint::ToString(val), scale, out);
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        }
         default:
             // Fallback: use Value::ToString() via chunk GetValue
             // Caller must handle this case by falling back to GetValue path
+            return false;
+    }
+}
+
+//===----------------------------------------------------------------------===//
+// Binary Cell Formatting (PG binary wire format, big-endian)
+//===----------------------------------------------------------------------===//
+
+// Format a cell as PG binary into byte buffer. Returns false if NULL or unsupported type.
+// Supported: BOOL, TINYINT, SMALLINT, INTEGER, BIGINT, UTINYINT, USMALLINT, UINTEGER, UBIGINT,
+//            FLOAT, DOUBLE
+inline bool FormatCellBinary(const duckdb::UnifiedVectorFormat& col_data,
+                             idx_t row_idx,
+                             const duckdb::LogicalType& type,
+                             std::vector<uint8_t>& out) {
+    auto idx = col_data.sel->get_index(row_idx);
+    if (!col_data.validity.RowIsValid(idx)) {
+        return false;  // NULL
+    }
+
+    switch (type.id()) {
+        case duckdb::LogicalTypeId::BOOLEAN: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<bool>(col_data)[idx];
+            out.resize(1);
+            out[0] = val ? 1 : 0;
+            return true;
+        }
+        case duckdb::LogicalTypeId::TINYINT: {
+            // PG INT2 = 2 bytes big-endian
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int8_t>(col_data)[idx];
+            int16_t v16 = static_cast<int16_t>(val);
+            int16_t net = htons(static_cast<uint16_t>(v16));
+            out.resize(2);
+            std::memcpy(out.data(), &net, 2);
+            return true;
+        }
+        case duckdb::LogicalTypeId::SMALLINT: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int16_t>(col_data)[idx];
+            int16_t net = htons(static_cast<uint16_t>(val));
+            out.resize(2);
+            std::memcpy(out.data(), &net, 2);
+            return true;
+        }
+        case duckdb::LogicalTypeId::INTEGER: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int32_t>(col_data)[idx];
+            int32_t net = htonl(static_cast<uint32_t>(val));
+            out.resize(4);
+            std::memcpy(out.data(), &net, 4);
+            return true;
+        }
+        case duckdb::LogicalTypeId::BIGINT: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<int64_t>(col_data)[idx];
+            uint64_t v = static_cast<uint64_t>(val);
+            uint64_t net =
+                ((v & 0x00000000000000FFULL) << 56) |
+                ((v & 0x000000000000FF00ULL) << 40) |
+                ((v & 0x0000000000FF0000ULL) << 24) |
+                ((v & 0x00000000FF000000ULL) << 8)  |
+                ((v & 0x000000FF00000000ULL) >> 8)  |
+                ((v & 0x0000FF0000000000ULL) >> 24) |
+                ((v & 0x00FF000000000000ULL) >> 40) |
+                ((v & 0xFF00000000000000ULL) >> 56);
+            out.resize(8);
+            std::memcpy(out.data(), &net, 8);
+            return true;
+        }
+        case duckdb::LogicalTypeId::UTINYINT: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<uint8_t>(col_data)[idx];
+            int16_t v16 = static_cast<int16_t>(val);
+            int16_t net = htons(static_cast<uint16_t>(v16));
+            out.resize(2);
+            std::memcpy(out.data(), &net, 2);
+            return true;
+        }
+        case duckdb::LogicalTypeId::USMALLINT: {
+            // Sent as INT2 (fits in signed range: 0..65535 needs INT4 but OID is INT2,
+            // actually USMALLINT max 65535 > INT2 max 32767, so send as INT4)
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<uint16_t>(col_data)[idx];
+            int32_t v32 = static_cast<int32_t>(val);
+            int32_t net = htonl(static_cast<uint32_t>(v32));
+            out.resize(4);
+            std::memcpy(out.data(), &net, 4);
+            return true;
+        }
+        // UINTEGER and UBIGINT are mapped to NUMERIC OID — no simple binary encoding,
+        // fall through to text format.
+        case duckdb::LogicalTypeId::FLOAT: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<float>(col_data)[idx];
+            uint32_t bits;
+            std::memcpy(&bits, &val, 4);
+            uint32_t net = htonl(bits);
+            out.resize(4);
+            std::memcpy(out.data(), &net, 4);
+            return true;
+        }
+        case duckdb::LogicalTypeId::DOUBLE: {
+            auto val = duckdb::UnifiedVectorFormat::GetDataUnsafe<double>(col_data)[idx];
+            uint64_t bits;
+            std::memcpy(&bits, &val, 8);
+            uint64_t net =
+                ((bits & 0x00000000000000FFULL) << 56) |
+                ((bits & 0x000000000000FF00ULL) << 40) |
+                ((bits & 0x0000000000FF0000ULL) << 24) |
+                ((bits & 0x00000000FF000000ULL) << 8)  |
+                ((bits & 0x000000FF00000000ULL) >> 8)  |
+                ((bits & 0x0000FF0000000000ULL) >> 24) |
+                ((bits & 0x00FF000000000000ULL) >> 40) |
+                ((bits & 0xFF00000000000000ULL) >> 56);
+            out.resize(8);
+            std::memcpy(out.data(), &net, 8);
+            return true;
+        }
+        default:
+            // Unsupported type for binary format — caller should fall back to text
             return false;
     }
 }

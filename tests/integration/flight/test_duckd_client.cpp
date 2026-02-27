@@ -1682,6 +1682,297 @@ static int TestLimitPushdown(DuckdClientTest &t) {
 }
 
 //===----------------------------------------------------------------------===//
+// Tests: LIST / STRUCT / MAP columnar conversion (C5)
+//===----------------------------------------------------------------------===//
+
+static int TestNestedTypes(DuckdClientTest &t) {
+    int passed = 0, failed = 0;
+
+    // ---------- INTEGER[] (LIST of fixed-width) ----------
+    TEST_BEGIN("LIST(INTEGER): basic integer array");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT [1, 2, 3] AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "[1, 2, 3]") {
+                TEST_FAIL("expected [1, 2, 3], got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- VARCHAR[] (LIST of variable-width) ----------
+    TEST_BEGIN("LIST(VARCHAR): string array");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT [''hello'', ''world''] AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "[hello, world]") {
+                TEST_FAIL("expected [hello, world], got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- Multi-row LIST ----------
+    TEST_BEGIN("LIST(INTEGER): multi-row with varying lengths");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT unnest([[1,2],[3,4,5],[6]]) AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 3) {
+            TEST_FAIL("expected 3 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            auto r0 = r->GetValue(0, 0).ToString();
+            auto r1 = r->GetValue(0, 1).ToString();
+            auto r2 = r->GetValue(0, 2).ToString();
+            if (r0 != "[1, 2]" || r1 != "[3, 4, 5]" || r2 != "[6]") {
+                TEST_FAIL("wrong values: " + r0 + ", " + r1 + ", " + r2);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- LIST with NULLs (null elements and null list) ----------
+    TEST_BEGIN("LIST(INTEGER): NULL handling");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT unnest([[1, NULL, 3], NULL, [4]]) AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 3) {
+            TEST_FAIL("expected 3 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            auto v0 = r->GetValue(0, 0).ToString();
+            auto v1 = r->GetValue(0, 1);
+            auto v2 = r->GetValue(0, 2).ToString();
+            if (v0 != "[1, NULL, 3]") {
+                TEST_FAIL("row 0: expected [1, NULL, 3], got " + v0);
+            } else if (!v1.IsNull()) {
+                TEST_FAIL("row 1: expected NULL, got " + v1.ToString());
+            } else if (v2 != "[4]") {
+                TEST_FAIL("row 2: expected [4], got " + v2);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- Empty list ----------
+    TEST_BEGIN("LIST(INTEGER): empty list");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT []::INTEGER[] AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "[]") {
+                TEST_FAIL("expected [], got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- STRUCT ----------
+    TEST_BEGIN("STRUCT: basic struct");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT {''a'': 42, ''b'': ''hello''} AS s')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "{'a': 42, 'b': hello}") {
+                TEST_FAIL("expected {'a': 42, 'b': hello}, got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- STRUCT multi-row with NULLs ----------
+    TEST_BEGIN("STRUCT: multi-row with NULL fields");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT unnest([{''x'': 1, ''y'': ''a''}, {''x'': NULL, ''y'': ''b''}, NULL]) AS s')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 3) {
+            TEST_FAIL("expected 3 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            auto v0 = r->GetValue(0, 0).ToString();
+            auto v1 = r->GetValue(0, 1).ToString();
+            auto v2 = r->GetValue(0, 2);
+            if (v0 != "{'x': 1, 'y': a}") {
+                TEST_FAIL("row 0: got " + v0);
+            } else if (v1 != "{'x': NULL, 'y': b}") {
+                TEST_FAIL("row 1: got " + v1);
+            } else if (!v2.IsNull()) {
+                TEST_FAIL("row 2: expected NULL, got " + v2.ToString());
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- MAP ----------
+    TEST_BEGIN("MAP: basic map");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT MAP {''key1'': 10, ''key2'': 20} AS m')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "{key1=10, key2=20}") {
+                TEST_FAIL("expected {key1=10, key2=20}, got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- Nested: LIST(STRUCT) ----------
+    TEST_BEGIN("LIST(STRUCT): nested list of structs");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT [{''a'': 1}, {''a'': 2}] AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "[{'a': 1}, {'a': 2}]") {
+                TEST_FAIL("expected [{'a': 1}, {'a': 2}], got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- Nested: STRUCT with LIST field ----------
+    TEST_BEGIN("STRUCT with LIST field");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT {''name'': ''Alice'', ''scores'': [90, 85, 92]} AS s')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "{'name': Alice, 'scores': [90, 85, 92]}") {
+                TEST_FAIL("got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- Nested: LIST(LIST(INTEGER)) ----------
+    TEST_BEGIN("LIST(LIST(INTEGER)): doubly nested list");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT [[1,2],[3]] AS arr')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            auto val = r->GetValue(0, 0).ToString();
+            if (val != "[[1, 2], [3]]") {
+                TEST_FAIL("expected [[1, 2], [3]], got " + val);
+            } else {
+                TEST_PASS();
+            }
+        }
+    }
+
+    // ---------- Large list (1000 elements) ----------
+    TEST_BEGIN("LIST(INTEGER): large list with 1000 elements");
+    {
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT list(i) AS arr FROM generate_series(1, 1000) AS t(i)')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else {
+            // Verify it's a list with 1000 elements
+            auto val = r->GetValue(0, 0);
+            auto children = duckdb::ListValue::GetChildren(val);
+            if (children.size() != 1000) {
+                TEST_FAIL("expected 1000 elements, got " + std::to_string(children.size()));
+            } else {
+                auto first = children[0].GetValue<int64_t>();
+                auto last  = children[999].GetValue<int64_t>();
+                if (first != 1 || last != 1000) {
+                    TEST_FAIL("wrong values: first=" + std::to_string(first) +
+                              " last=" + std::to_string(last));
+                } else {
+                    TEST_PASS();
+                }
+            }
+        }
+    }
+
+    // ---------- Multi-row LIST via inline query (bulk test) ----------
+    TEST_BEGIN("LIST(INTEGER): multi-row bulk with varying sizes");
+    {
+        // Generate 10 rows with lists of increasing length via server-side query
+        auto r = t.conn().Query(
+            "SELECT * FROM duckd_query('" + t.url() + "',"
+            " 'SELECT i, list(j ORDER BY j) AS vals"
+            "  FROM range(1, 11) AS t(i),"
+            "  range(1, i + 1) AS s(j)"
+            "  GROUP BY i ORDER BY i')");
+        if (r->HasError()) {
+            TEST_FAIL(r->GetError());
+        } else if (r->RowCount() != 10) {
+            TEST_FAIL("expected 10 rows, got " + std::to_string(r->RowCount()));
+        } else {
+            // Row i should have a list of length i
+            bool ok = true;
+            for (idx_t row = 0; row < 10; row++) {
+                auto val = r->GetValue(1, row);
+                auto children = duckdb::ListValue::GetChildren(val);
+                if (children.size() != row + 1) {
+                    TEST_FAIL("row " + std::to_string(row) + ": expected " +
+                              std::to_string(row + 1) + " elements, got " +
+                              std::to_string(children.size()));
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                TEST_PASS();
+            }
+        }
+    }
+
+    std::cout << "  Nested types: " << passed << " passed, "
+              << failed << " failed" << std::endl;
+    return failed;
+}
+
+//===----------------------------------------------------------------------===//
 // Main
 //===----------------------------------------------------------------------===//
 
@@ -1773,6 +2064,12 @@ int main() {
         std::cout << "\n--- LIMIT Pushdown Tests (3.5) ---" << std::endl;
         DuckdClientTest t;
         total_failures += TestLimitPushdown(t);
+    }
+
+    {
+        std::cout << "\n--- LIST/STRUCT/MAP Columnar Tests (C5) ---" << std::endl;
+        DuckdClientTest t;
+        total_failures += TestNestedTypes(t);
     }
 
     std::cout << "\n=== Summary ===" << std::endl;

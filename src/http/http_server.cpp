@@ -63,28 +63,25 @@ void HttpServer::DoAccept() {
 }
 
 void HttpServer::HandleConnection(asio::ip::tcp::socket socket) {
-    // Use a thread to handle synchronously (simple and reliable for health checks)
-    std::thread([this, socket = std::move(socket)]() mutable {
-        try {
-            // Read request
-            std::array<char, 4096> buffer;
-            asio::error_code ec;
-            size_t bytes_read = socket.read_some(asio::buffer(buffer), ec);
+    // Use async I/O on the existing io_context — no threads spawned per request.
+    auto sock = std::make_shared<asio::ip::tcp::socket>(std::move(socket));
+    auto buf = std::make_shared<std::array<char, 4096>>();
+
+    sock->async_read_some(asio::buffer(*buf),
+        [this, sock, buf](std::error_code ec, size_t bytes_read) {
             if (ec) return;
 
-            std::string request(buffer.data(), bytes_read);
+            std::string request(buf->data(), bytes_read);
             std::string response = HandleRequest(request);
 
-            // Write response
-            asio::write(socket, asio::buffer(response), ec);
-
-            // Close socket
-            socket.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
-            socket.close(ec);
-        } catch (...) {
-            // Ignore errors
-        }
-    }).detach();
+            auto resp = std::make_shared<std::string>(std::move(response));
+            asio::async_write(*sock, asio::buffer(*resp),
+                [sock, resp](std::error_code ec, size_t /*bytes_written*/) {
+                    asio::error_code shutdown_ec;
+                    sock->shutdown(asio::ip::tcp::socket::shutdown_both, shutdown_ec);
+                    sock->close(shutdown_ec);
+                });
+        });
 }
 
 std::string HttpServer::HandleRequest(const std::string& request) {

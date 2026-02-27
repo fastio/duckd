@@ -74,7 +74,6 @@ private:
     std::unique_ptr<flight::FlightStreamReader> current_stream_;
     std::vector<flight::FlightEndpoint>         endpoints_;
     size_t                                      ep_idx_      = 0;
-    flightsql::FlightSqlClient                 *sql_client_  = nullptr;
     flight::FlightCallOptions                   call_options_;
     std::shared_ptr<arrow::Schema>              schema_;
 };
@@ -127,6 +126,10 @@ public:
     // Execute a DML/DDL statement within an existing transaction.
     arrow::Result<int64_t> ExecuteUpdate(
         const std::string& sql, const flightsql::Transaction& txn);
+
+    // Accessor for the underlying FlightSqlClient, used by DuckdQueryStream
+    // to open subsequent endpoints without holding a raw pointer.
+    flightsql::FlightSqlClient &GetSqlClient() { return *client_; }
 
 private:
     DuckdFlightClient() = default;

@@ -102,7 +102,7 @@ private:
     std::thread cleanup_thread;
     std::mutex cleanup_mutex;
     std::condition_variable cleanup_cv;
-    int cleanup_counter = 0;
+    std::atomic<int> cleanup_counter_{0};
 };
 
 } // namespace duckdb_server
