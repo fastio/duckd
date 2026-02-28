@@ -138,34 +138,50 @@ ctest --test-dir build --output-on-failure
 
 ## Usage
 
+### PostgreSQL protocol
+
 ```bash
-# In-memory server
-./duckd-server
+# Start server
+./duckd-server --database /data/warehouse.duckdb --http-port 8080
 
-# Persistent database
-./duckd-server --database /data/warehouse.duckdb
-
-# With all protocols + monitoring
-./duckd-server --database /data/warehouse.duckdb \
-  --port 5432 --flight-port 8815 --http-port 8080
+# Connect with any PostgreSQL client
+psql -h localhost -p 5432 -U any -d any
 ```
 
 ```sql
--- Connect and query
-psql -h localhost -p 5432 -U any -d any
-
 SELECT * FROM read_parquet('s3://my-bucket/sales/*.parquet');
 SELECT * FROM read_csv('/data/report.csv', header=true);
+CREATE TABLE events AS SELECT * FROM read_parquet('/data/events/**/*.parquet');
+```
+
+### DuckDB native SDK
+
+```bash
+# Start server with Flight SQL enabled
+./duckd-server --database /data/warehouse.duckdb --port 5432 --flight-port 8815
 ```
 
 ```sql
--- DuckDB native SDK: attach remote server
+-- Attach remote DuckD server as a local catalog
 LOAD duckd_client;
 ATTACH 'grpc://analytics-server:8815' AS warehouse (TYPE duckd);
+
+-- Query remote tables, join with local data
 SELECT * FROM warehouse.main.sales WHERE year = 2024;
+SELECT duckd_exec('grpc://server:8815', 'INSERT INTO logs VALUES (now(), ''hello'')');
 ```
 
-For comprehensive examples — multi-language clients, COPY protocol, Arrow Flight SQL, federated queries, transactions, monitoring — see **[docs/examples.md](docs/examples.md)**.
+### More examples
+
+| Topic | Description |
+|-------|-------------|
+| [Multi-language clients](docs/examples.md#connecting-from-different-languages) | Python, Node.js, Java, Go, Rust, Pandas, GUI tools |
+| [COPY protocol](docs/examples.md#bulk-data-with-copy) | Bulk import/export via `\copy` and `copy_expert` |
+| [Transactions](docs/examples.md#transactions-and-prepared-statements) | Prepared statements, parameterized queries, rollback |
+| [Arrow Flight SQL](docs/examples.md#arrow-flight-sql) | pyarrow, ADBC — zero-copy columnar access |
+| [Federated queries](docs/examples.md#duckdb-native-sdk--federated-queries) | ATTACH, `duckd_query()`, `duckd_exec()`, multi-server |
+| [Monitoring](docs/examples.md#monitoring) | Health checks, Prometheus metrics integration |
+| [Configuration](docs/examples.md#configuration-examples) | YAML / INI config file templates |
 
 ## Configuration
 
