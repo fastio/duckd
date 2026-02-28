@@ -298,27 +298,6 @@ docker run -d --name duckd \
 - **Dual protocol.** PostgreSQL protocol for universal ecosystem compatibility (existing apps, BI tools — zero code changes); Arrow Flight SQL for native DuckDB SDK access and high-throughput columnar transfer.
 - **Zero external dependencies at runtime.** Single static binary. No JVM, no Python, no cluster coordinator.
 
-### Source layout
-
-```
-src/
-├── network/          # ASIO TCP server, per-connection I/O
-├── protocol/
-│   ├── pg/           # PostgreSQL wire protocol v3 (handler, reader, writer)
-│   └── flight/       # Arrow Flight SQL server (opt-in)
-├── session/          # Session lifecycle, SessionManager
-├── executor/         # ExecutorPool — lock-free task queue + worker threads
-├── http/             # /health and /metrics HTTP endpoints
-├── logging/          # spdlog logger with DuckDB storage backend
-├── config/           # ServerConfig, YAML/INI parser
-├── client/
-│   ├── remote-client/  # DuckDB extension (PG protocol)
-│   └── duckd-client/   # DuckDB extension (Flight SQL)
-├── programs/
-│   ├── server/       # Server entry point
-│   └── client/       # CLI client entry point
-└── tests/            # Unit + integration tests
-```
 
 ## Contributing
 
