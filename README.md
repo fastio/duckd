@@ -56,33 +56,6 @@ For workloads that need maximum throughput, DuckD also serves **Arrow Flight SQL
 - **Arrow-native data transfer** — columnar data flows over the wire in Apache Arrow format with near-zero serialization cost. Ideal for data science workloads and large result sets.
 - **`duckd_query()` / `duckd_exec()`** — table functions that let a local DuckDB execute SQL on a remote DuckD and consume the results natively.
 
-### Together: two protocols, one server
-
-```
-    ┌─────────────────────────────────────────────────────────────────────────┐
-    │  Your existing infrastructure                                         │
-    │                                                                       │
-    │  psql, JDBC, psycopg2,          DuckDB instances,                     │
-    │  Metabase, Grafana, ...         pyarrow, ADBC, ...                    │
-    │         │                              │                              │
-    │         │ PostgreSQL protocol           │ Arrow Flight SQL (gRPC)      │
-    │         │ (zero code changes)           │ (native columnar)            │
-    └─────────┼──────────────────────────────┼──────────────────────────────┘
-              ▼                              ▼
-        ┌──────────────────────────────────────────┐
-        │              DuckD Server                │
-        │                                          │
-        │   TCP :5432            gRPC :8815         │
-        │   PG handler           Flight SQL        │
-        │         └──────┬───────────┘             │
-        │                ▼                         │
-        │          ExecutorPool                    │
-        │          SessionManager ──► DuckDB       │
-        │                                          │
-        │   HTTP :8080  /health  /metrics          │
-        └──────────────────────────────────────────┘
-```
-
 PostgreSQL protocol gives you **instant compatibility** with the entire database ecosystem. Arrow Flight SQL gives you **native DuckDB power** at wire speed. Same server, same data, pick the right protocol for each client.
 
 ## Features
